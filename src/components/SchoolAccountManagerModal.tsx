@@ -17,6 +17,7 @@ import {
   AlertTriangle,
   UserCheck,
   Copy,
+  Lock,
   Plus
 } from 'lucide-react';
 import { AppUser, Participant, SchoolLevel } from '../App';
@@ -101,9 +102,24 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
     return map;
   }, [pesertaList]);
 
+  const canViewPasswords = useMemo(() => {
+    return Boolean(
+      currentUser && (
+        currentUser.role === 'admin' ||
+        currentUser.role === 'superadmin' ||
+        currentUser.username.toLowerCase() === 'admin' ||
+        currentUser.username.toLowerCase() === 'administrator'
+      )
+    );
+  }, [currentUser]);
+
   if (!isOpen) return null;
 
   const toggleShowPassword = (username: string) => {
+    if (!canViewPasswords) {
+      showToast('Hanya akun Admin dan Super Admin yang berhak melihat password!', 'error');
+      return;
+    }
     setShowPasswords(prev => ({
       ...prev,
       [username]: !prev[username]
@@ -111,6 +127,10 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
   };
 
   const copyToClipboard = (text: string, label: string) => {
+    if (label.toLowerCase().includes('password') && !canViewPasswords) {
+      showToast('Hanya akun Admin dan Super Admin yang berhak menyalin password!', 'error');
+      return;
+    }
     if (navigator.clipboard) {
       navigator.clipboard.writeText(text);
       showToast(`${label} disalin ke clipboard!`, 'info');
@@ -363,7 +383,7 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
         school,
         u.schoolLevel || 'SLTP',
         u.username,
-        u.password || '123456',
+        canViewPasswords ? (u.password || '123456') : '•••••••• (Hanya Admin)',
         u.pembinaName || '-',
         u.contactWa || '-',
         `${count} Kontingen`
@@ -616,25 +636,37 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
 
                             {/* Password */}
                             <td className="py-3 px-3">
-                              <div className="flex items-center gap-1 font-mono">
-                                <span className="bg-amber-50 text-amber-900 border border-amber-200 px-1.5 py-0.5 rounded text-[11px] font-bold">
-                                  {isPwdShown ? (u.password || '-') : '••••••••'}
+                              {canViewPasswords ? (
+                                <div className="flex items-center gap-1 font-mono">
+                                  <span className={`px-1.5 py-0.5 rounded text-[11px] font-bold border transition ${
+                                    isPwdShown ? 'bg-amber-50 text-amber-900 border-amber-200' : 'bg-slate-100 text-slate-700 border-slate-200'
+                                  }`}>
+                                    {isPwdShown ? (u.password || '-') : '••••••••'}
+                                  </span>
+                                  <button
+                                    onClick={() => toggleShowPassword(u.username)}
+                                    title={isPwdShown ? "Sembunyikan Password" : "Lihat Password"}
+                                    className="p-1 text-slate-400 hover:text-slate-700 rounded cursor-pointer transition"
+                                  >
+                                    {isPwdShown ? <EyeOff className="w-3.5 h-3.5 text-amber-700" /> : <Eye className="w-3.5 h-3.5" />}
+                                  </button>
+                                  <button
+                                    onClick={() => copyToClipboard(u.password || '', 'Password')}
+                                    title="Salin Password"
+                                    className="p-1 text-slate-400 hover:text-slate-700 rounded cursor-pointer transition"
+                                  >
+                                    <Copy className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              ) : (
+                                <span
+                                  className="inline-flex items-center gap-1 font-mono bg-slate-100 text-slate-400 border border-slate-200 px-2 py-0.5 rounded text-[11px] font-medium"
+                                  title="Hanya akun Admin dan Super Admin yang berhak melihat password akun sekolah"
+                                >
+                                  <Lock className="w-3 h-3 text-slate-400" />
+                                  <span>••••••••</span>
                                 </span>
-                                <button
-                                  onClick={() => toggleShowPassword(u.username)}
-                                  title={isPwdShown ? "Sembunyikan Password" : "Lihat Password"}
-                                  className="p-1 text-slate-400 hover:text-slate-700 rounded cursor-pointer"
-                                >
-                                  {isPwdShown ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
-                                </button>
-                                <button
-                                  onClick={() => copyToClipboard(u.password || '', 'Password')}
-                                  title="Salin Password"
-                                  className="p-1 text-slate-400 hover:text-slate-700 rounded cursor-pointer"
-                                >
-                                  <Copy className="w-3 h-3" />
-                                </button>
-                              </div>
+                              )}
                             </td>
 
                             {/* Pembina & Contact */}
