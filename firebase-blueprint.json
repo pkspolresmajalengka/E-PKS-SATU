@@ -1,0 +1,281 @@
+{
+  "entities": {
+    "Participant": {
+      "title": "Participant",
+      "description": "Kontingen peserta lomba PBB PKS beserta rincian nilai 11 kriteria",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier peserta",
+          "maxLength": 128
+        },
+        "nomor": {
+          "type": "string",
+          "description": "Nomor urut peserta",
+          "maxLength": 20
+        },
+        "peleton": {
+          "type": "string",
+          "description": "Nama peleton peserta",
+          "maxLength": 100
+        },
+        "jenjang": {
+          "type": "string",
+          "description": "Jenjang pendidikan (SLTP atau SLTA)",
+          "enum": ["SLTP", "SLTA"]
+        },
+        "sekolah": {
+          "type": "string",
+          "description": "Nama asal sekolah",
+          "maxLength": 150
+        },
+        "tanggal": {
+          "type": "string",
+          "description": "Tanggal pelaksanaan",
+          "maxLength": 50
+        },
+        "juri": {
+          "type": "string",
+          "description": "Nama juri penilai",
+          "maxLength": 100
+        },
+        "scores": {
+          "type": "object",
+          "description": "Objek nilai untuk 11 kriteria penilaian"
+        },
+        "notes": {
+          "type": "string",
+          "description": "Catatan juri untuk peserta",
+          "maxLength": 1000
+        },
+        "sheetPhotoUrl": {
+          "type": "string",
+          "description": "Foto/scan lembar penilaian juri"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Waktu terakhir pembaruan data"
+        }
+      },
+      "required": ["id", "nomor", "peleton", "jenjang", "sekolah"]
+    },
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Akun pengguna sistem (Admin, Juri, dan Perwakilan Sekolah)",
+      "type": "object",
+      "properties": {
+        "username": {
+          "type": "string",
+          "description": "Username unik untuk login",
+          "maxLength": 100
+        },
+        "password": {
+          "type": "string",
+          "description": "Password login",
+          "maxLength": 100
+        },
+        "name": {
+          "type": "string",
+          "description": "Nama lengkap pengguna atau nama sekolah",
+          "maxLength": 150
+        },
+        "role": {
+          "type": "string",
+          "description": "Peran akun dalam sistem",
+          "enum": ["superadmin", "admin", "juri", "sekolah", "user"]
+        },
+        "schoolName": {
+          "type": "string",
+          "description": "Nama sekolah jika peran sekolah",
+          "maxLength": 150
+        },
+        "schoolLevel": {
+          "type": "string",
+          "description": "Jenjang sekolah jika peran sekolah",
+          "enum": ["SLTP", "SLTA"]
+        },
+        "pembinaName": {
+          "type": "string",
+          "description": "Nama guru pembina pendamping",
+          "maxLength": 150
+        },
+        "contactWa": {
+          "type": "string",
+          "description": "Nomor WhatsApp pembina",
+          "maxLength": 30
+        },
+        "isCustom": {
+          "type": "boolean",
+          "description": "Penanda akun tambahan mandiri"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Waktu pembaruan"
+        }
+      },
+      "required": ["username", "name", "role"]
+    },
+    "AppConfig": {
+      "title": "AppConfig",
+      "description": "Konfigurasi kriteria, bobot, dan teknis penilaian",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Identifier config",
+          "maxLength": 50
+        },
+        "categories": {
+          "type": "object",
+          "description": "Data kategori dan bobot penilaian"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Waktu update konfigurasi"
+        }
+      },
+      "required": ["id"]
+    },
+    "AppLogo": {
+      "title": "AppLogo",
+      "description": "Pengaturan logo institusi / perlombaan",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Identifier logo",
+          "maxLength": 50
+        },
+        "logoUrl": {
+          "type": "string",
+          "description": "URL atau Base64 gambar logo"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Waktu update logo"
+        }
+      },
+      "required": ["id"]
+    },
+    "AppStatus": {
+      "title": "AppStatus",
+      "description": "Status aktif/nonaktif aplikasi beserta pesan penonaktifan kustom yang hanya dapat dikelola admin",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Identifier status",
+          "maxLength": 50
+        },
+        "isActive": {
+          "type": "boolean",
+          "description": "Status operasional aplikasi: true (aktif) atau false (nonaktif/maintenance)"
+        },
+        "title": {
+          "type": "string",
+          "description": "Judul kustom pengumuman penonaktifan aplikasi",
+          "maxLength": 200
+        },
+        "message": {
+          "type": "string",
+          "description": "Isi pesan kustom pengumuman penonaktifan aplikasi",
+          "maxLength": 2000
+        },
+        "estimateTime": {
+          "type": "string",
+          "description": "Estimasi waktu aktif kembali atau jadwal buka",
+          "maxLength": 100
+        },
+        "contactInfo": {
+          "type": "string",
+          "description": "Informasi narahubung panitia/administrator",
+          "maxLength": 100
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Waktu pembaruan status"
+        },
+        "updatedBy": {
+          "type": "string",
+          "description": "Username admin yang melakukan perubahan",
+          "maxLength": 100
+        }
+      },
+      "required": ["id", "isActive", "title", "message"]
+    },
+    "RegistrationSubmission": {
+      "title": "RegistrationSubmission",
+      "description": "Pengajuan berkas 4 formulir pendaftaran PKS resmi",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "ID pengajuan formulir",
+          "maxLength": 128
+        },
+        "formType": {
+          "type": "string",
+          "description": "Jenis formulir pendaftaran",
+          "enum": ["polisi_pelajar", "calon_pks", "kemah_balok1", "pks_balok2"]
+        },
+        "schoolName": {
+          "type": "string",
+          "description": "Nama asal sekolah",
+          "maxLength": 150
+        },
+        "studentName": {
+          "type": "string",
+          "description": "Nama siswa / pendaftar",
+          "maxLength": 150
+        },
+        "submissionDate": {
+          "type": "string",
+          "description": "Tanggal pendaftaran",
+          "maxLength": 50
+        },
+        "data": {
+          "type": "object",
+          "description": "Rincian isi formulir pendaftaran"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Waktu pengajuan"
+        }
+      },
+      "required": ["id", "formType", "schoolName"]
+    }
+  },
+  "firestore": {
+    "/participants/{participantId}": {
+      "schema": {
+        "$ref": "#/entities/Participant"
+      },
+      "description": "Koleksi data peserta dan penilaian rekapitulasi lomba"
+    },
+    "/users/{username}": {
+      "schema": {
+        "$ref": "#/entities/UserAccount"
+      },
+      "description": "Koleksi akun pengguna sistem"
+    },
+    "/config/{configId}": {
+      "schema": {
+        "$ref": "#/entities/AppConfig"
+      },
+      "description": "Konfigurasi kriteria penilaian dan bobot juknis"
+    },
+    "/settings/{settingId}": {
+      "schema": {
+        "$ref": "#/entities/AppLogo"
+      },
+      "description": "Pengaturan logo aplikasi dan informasi umum"
+    },
+    "/registrations/{registrationId}": {
+      "schema": {
+        "$ref": "#/entities/RegistrationSubmission"
+      },
+      "description": "Formulir pendaftaran digital 4 jenis kegiatan PKS"
+    }
+  }
+}

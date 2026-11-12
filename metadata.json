@@ -1,0 +1,8 @@
+{
+  "name": "Remix Sistem E-PKS Satu Polres Majalengka",
+  "description": "Aplikasi rekapitulasi nilai lomba PKS terpadu otentikasi multi-user (Admin, Juri, User, pendaftaran) berbasis peran.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,49 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny catch-all for any unmapped path
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128;
+    }
+
+    // Peserta & Kontingen Lomba
+    match /participants/{participantId} {
+      allow read: if true;
+      allow write: if isValidId(participantId);
+    }
+
+    // Akun Pengguna (Admin, Juri, Sekolah)
+    match /users/{username} {
+      allow read: if true;
+      allow write: if isValidId(username);
+    }
+
+    // Konfigurasi Kriteria & Juknis Bobot
+    match /config/{configId} {
+      allow read: if true;
+      allow write: if isValidId(configId);
+    }
+
+    // Pengaturan Logo & Branding
+    match /settings/{settingId} {
+      allow read: if true;
+      allow write: if isValidId(settingId);
+    }
+
+    // Formulir Pendaftaran PKS
+    match /registrations/{registrationId} {
+      allow read: if true;
+      allow write: if isValidId(registrationId);
+    }
+
+    // Test connection doc
+    match /test/{docId} {
+      allow read, write: if true;
+    }
+  }
+}
