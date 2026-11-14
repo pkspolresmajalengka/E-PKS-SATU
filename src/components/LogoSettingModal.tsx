@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   X,
   Upload,
@@ -7,15 +7,19 @@ import {
   Check,
   Link,
   Shield,
-  AlertCircle
+  AlertCircle,
+  Loader2
 } from 'lucide-react';
+import { CloudWriteResult } from '../lib/firebase';
+import { compressImageFile } from '../lib/imageUtils';
+import { NetworkErrorBanner, NetworkErrorState } from './NetworkErrorBanner';
 
 interface LogoSettingModalProps {
   isOpen: boolean;
   onClose: () => void;
   currentLogo: string | null;
-  onSaveLogo: (logoDataUrl: string) => void;
-  onResetLogo: () => void;
+  onSaveLogo: (logoDataUrl: string) => Promise<CloudWriteResult | void> | void;
+  onResetLogo: () => Promise<CloudWriteResult | void> | void;
   showToast: (message: string, type?: 'success' | 'error' | 'info') => void;
 }
 
@@ -30,11 +34,24 @@ export const LogoSettingModal: React.FC<LogoSettingModalProps> = ({
   const [previewLogo, setPreviewLogo] = useState<string | null>(currentLogo);
   const [logoUrlInput, setLogoUrlInput] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+  const [networkError, setNetworkError] = useState<NetworkErrorState | null>(null);
+  const [isProcessingImage, setIsProcessingImage] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      setPreviewLogo(currentLogo);
+      setLogoUrlInput('');
+      setErrorMsg('');
+      setNetworkError(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }, [isOpen, currentLogo]);
 
   if (!isOpen) return null;
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     setErrorMsg('');
     const file = e.target.files?.[0];
     if (!file) return;
@@ -44,20 +61,25 @@ export const LogoSettingModal: React.FC<LogoSettingModalProps> = ({
       return;
     }
 
-    if (file.size > 2 * 1024 * 1024) {
-      setErrorMsg('Ukuran berkas logo maksimal 2 MB agar tidak memperlambat aplikasi.');
+    if (file.size > 5 * 1024 * 1024) {
+      setErrorMsg('Ukuran berkas logo maksimal 5 MB.');
       return;
     }
 
-    const reader = new FileReader();
-    reader.onload = event => {
-      const result = event.target?.result as string;
-      setPreviewLogo(result);
-    };
-    reader.onerror = () => {
-      setErrorMsg('Gagal membaca berkas logo.');
-    };
-    reader.readAsDataURL(file);
+    setIsProcessingImage(true);
+    try {
+      const compressed = await compressImageFile(file, {
+        maxDimension: 800,
+        maxDataUrlBytes: 520 * 1024,
+        preferPng: true
+      });
+      setPreviewLogo(compressed);
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Gagal memproses berkas logo.');
+    } finally {
+      setIsProcessingImage(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
   };
 
   const handleApplyUrl = () => {
@@ -69,19 +91,46 @@ export const LogoSettingModal: React.FC<LogoSettingModalProps> = ({
     setPreviewLogo(logoUrlInput.trim());
   };
 
-  const handleSave = () => {
-    if (!previewLogo) {
-      onResetLogo();
-    } else {
-      onSaveLogo(previewLogo);
+  const handleSave = async () => {
+    setIsSaving(true);
+    setNetworkError(null);
+    try {
+      const res = previewLogo ? await onSaveLogo(previewLogo) : await onResetLogo();
+      if (res && !res.success) {
+        setNetworkError({
+          title: 'Gagal Menyimpan Logo ke Cloud',
+          message: res.error || 'Terjadi gangguan jaringan saat menyimpan logo aplikasi.',
+          isNetworkError: res.isNetworkError,
+          onRetry: handleSave
+        });
+        return;
+      }
+      onClose();
+    } finally {
+      setIsSaving(false);
     }
-    onClose();
   };
 
-  const handleReset = () => {
-    setPreviewLogo(null);
-    setLogoUrlInput('');
-    onResetLogo();
+  const handleReset = async () => {
+    setIsSaving(true);
+    setNetworkError(null);
+    try {
+      const res = await onResetLogo();
+      if (res && !res.success) {
+        setNetworkError({
+          title: 'Gagal Mereset Logo di Cloud',
+          message: res.error || 'Terjadi gangguan jaringan saat mereset logo.',
+          isNetworkError: res.isNetworkError,
+          onRetry: handleReset
+        });
+        return;
+      }
+      setPreviewLogo(null);
+      setLogoUrlInput('');
+      onClose();
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -101,8 +150,10 @@ export const LogoSettingModal: React.FC<LogoSettingModalProps> = ({
             </div>
           </div>
           <button
+            type="button"
+            disabled={isSaving}
             onClick={onClose}
-            className="text-slate-400 hover:text-white p-1 rounded-lg cursor-pointer"
+            className="text-slate-400 hover:text-white disabled:opacity-50 p-1 rounded-lg cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -110,9 +161,11 @@ export const LogoSettingModal: React.FC<LogoSettingModalProps> = ({
 
         {/* Content Body */}
         <div className="p-5 sm:p-6 overflow-y-auto space-y-5 flex-1">
+          <NetworkErrorBanner error={networkError} onDismiss={() => setNetworkError(null)} />
+
           {errorMsg && (
-            <div className="bg-rose-50 border-l-4 border-rose-500 p-3 rounded-r text-xs text-rose-700 flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 text-rose-500 shrink-0" />
+            <div className="bg-rose-50 border border-rose-300 p-3 rounded-xl text-xs text-rose-800 flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
               <span>{errorMsg}</span>
             </div>
           )}
@@ -218,8 +271,9 @@ export const LogoSettingModal: React.FC<LogoSettingModalProps> = ({
         <div className="bg-slate-100 px-5 py-3.5 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2 shrink-0">
           <button
             type="button"
+            disabled={isSaving}
             onClick={handleReset}
-            className="text-xs text-rose-600 hover:text-rose-800 font-bold flex items-center gap-1.5 cursor-pointer py-1.5 px-3 rounded-lg hover:bg-rose-50 transition"
+            className="text-xs text-rose-600 hover:text-rose-800 disabled:opacity-50 font-bold flex items-center gap-1.5 cursor-pointer py-1.5 px-3 rounded-lg hover:bg-rose-50 transition"
           >
             <RotateCcw className="w-3.5 h-3.5" />
             <span>Reset ke Lambang Default PKS</span>
@@ -228,18 +282,34 @@ export const LogoSettingModal: React.FC<LogoSettingModalProps> = ({
           <div className="flex items-center gap-2">
             <button
               type="button"
+              disabled={isSaving}
               onClick={onClose}
-              className="px-4 py-1.5 border border-slate-300 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-200 cursor-pointer transition"
+              className="px-4 py-1.5 border border-slate-300 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-200 disabled:opacity-50 cursor-pointer transition"
             >
               Batal
             </button>
             <button
               type="button"
+              disabled={isSaving || isProcessingImage}
               onClick={handleSave}
-              className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-1.5 px-4 rounded-xl text-xs flex items-center gap-1.5 shadow-sm cursor-pointer transition"
+              className="bg-blue-600 hover:bg-blue-700 disabled:opacity-75 text-white font-bold py-1.5 px-4 rounded-xl text-xs flex items-center gap-1.5 shadow-sm cursor-pointer transition"
             >
-              <Check className="w-3.5 h-3.5" />
-              <span>Terapkan Logo Baru</span>
+              {isSaving ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>Menyimpan...</span>
+                </>
+              ) : isProcessingImage ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>Memproses Logo...</span>
+                </>
+              ) : (
+                <>
+                  <Check className="w-3.5 h-3.5" />
+                  <span>Terapkan Logo Baru</span>
+                </>
+              )}
             </button>
           </div>
         </div>

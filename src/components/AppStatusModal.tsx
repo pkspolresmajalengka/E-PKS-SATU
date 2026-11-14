@@ -10,15 +10,17 @@ import {
   Sparkles,
   Eye,
   ShieldAlert,
-  Info
+  Info,
+  Loader2
 } from 'lucide-react';
-import { AppStatusConfig } from '../lib/firebase';
+import { AppStatusConfig, CloudWriteResult } from '../lib/firebase';
+import { NetworkErrorBanner, NetworkErrorState } from './NetworkErrorBanner';
 
 interface AppStatusModalProps {
   isOpen: boolean;
   onClose: () => void;
   currentStatus: AppStatusConfig;
-  onSaveStatus: (newStatus: AppStatusConfig) => Promise<void>;
+  onSaveStatus: (newStatus: AppStatusConfig) => Promise<CloudWriteResult | void>;
   showToast: (message: string, type?: 'success' | 'error' | 'info') => void;
   appLogo: string | null;
 }
@@ -72,6 +74,7 @@ export const AppStatusModal: React.FC<AppStatusModalProps> = ({
   const [estimateTime, setEstimateTime] = useState<string>(currentStatus.estimateTime || '');
   const [contactInfo, setContactInfo] = useState<string>(currentStatus.contactInfo || '');
   const [isSaving, setIsSaving] = useState(false);
+  const [networkError, setNetworkError] = useState<NetworkErrorState | null>(null);
   const [showPreview, setShowPreview] = useState(false);
 
   useEffect(() => {
@@ -82,6 +85,7 @@ export const AppStatusModal: React.FC<AppStatusModalProps> = ({
       setEstimateTime(currentStatus.estimateTime || '');
       setContactInfo(currentStatus.contactInfo || '');
       setShowPreview(false);
+      setNetworkError(null);
     }
   }, [isOpen, currentStatus]);
 
@@ -95,14 +99,9 @@ export const AppStatusModal: React.FC<AppStatusModalProps> = ({
     showToast(`Template "${preset.label}" diterapkan ke formulir.`, 'info');
   };
 
-  const handleFormSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!title.trim() || !message.trim()) {
-      showToast('Judul dan pesan penonaktifan wajib diisi!', 'error');
-      return;
-    }
-
+  const executeSaveStatus = async () => {
     setIsSaving(true);
+    setNetworkError(null);
     try {
       const updated: AppStatusConfig = {
         id: 'app_status',
@@ -114,7 +113,17 @@ export const AppStatusModal: React.FC<AppStatusModalProps> = ({
         updatedAt: new Date().toISOString(),
         updatedBy: 'admin'
       };
-      await onSaveStatus(updated);
+      const res = await onSaveStatus(updated);
+      if (res && !res.success) {
+        setNetworkError({
+          title: 'Gagal Menyimpan Status Aplikasi ke Cloud',
+          message: res.error || 'Terjadi gangguan jaringan saat menyimpan status aplikasi.',
+          isNetworkError: res.isNetworkError,
+          onRetry: executeSaveStatus
+        });
+        showToast(res.error || 'Gagal memperbarui status aplikasi ke Cloud.', 'error');
+        return;
+      }
       showToast(
         isActive
           ? 'Aplikasi telah diaktifkan kembali untuk seluruh pengguna!'
@@ -122,12 +131,27 @@ export const AppStatusModal: React.FC<AppStatusModalProps> = ({
         isActive ? 'success' : 'info'
       );
       onClose();
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
+      setNetworkError({
+        title: 'Gagal Menyimpan Status Aplikasi',
+        message: err?.message || 'Terjadi gangguan jaringan saat memperbarui status aplikasi.',
+        isNetworkError: true,
+        onRetry: executeSaveStatus
+      });
       showToast('Gagal memperbarui status aplikasi.', 'error');
     } finally {
       setIsSaving(false);
     }
+  };
+
+  const handleFormSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!title.trim() || !message.trim()) {
+      showToast('Judul dan pesan penonaktifan wajib diisi!', 'error');
+      return;
+    }
+    await executeSaveStatus();
   };
 
   return (
@@ -158,8 +182,10 @@ export const AppStatusModal: React.FC<AppStatusModalProps> = ({
             </div>
           </div>
           <button
+            type="button"
+            disabled={isSaving}
             onClick={onClose}
-            className="text-slate-400 hover:text-white p-1 rounded-lg cursor-pointer"
+            className="text-slate-400 hover:text-white disabled:opacity-50 p-1 rounded-lg cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -167,6 +193,7 @@ export const AppStatusModal: React.FC<AppStatusModalProps> = ({
 
         {/* Content Form */}
         <form onSubmit={handleFormSubmit} className="p-5 sm:p-6 space-y-4 overflow-y-auto flex-1">
+          <NetworkErrorBanner error={networkError} onDismiss={() => setNetworkError(null)} />
           {/* Main Toggle Switch Card */}
           <div className={`p-4 rounded-2xl border transition-all ${
             isActive
@@ -335,8 +362,9 @@ export const AppStatusModal: React.FC<AppStatusModalProps> = ({
           <div className="pt-4 border-t border-slate-200 flex items-center justify-between">
             <button
               type="button"
+              disabled={isSaving}
               onClick={onClose}
-              className="px-4 py-2 border border-slate-300 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-100 cursor-pointer"
+              className="px-4 py-2 border border-slate-300 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
             >
               Batal
             </button>
@@ -346,10 +374,19 @@ export const AppStatusModal: React.FC<AppStatusModalProps> = ({
               disabled={isSaving}
               className={`px-5 py-2 text-white text-xs font-bold rounded-xl shadow cursor-pointer flex items-center gap-1.5 transition ${
                 isActive ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-rose-600 hover:bg-rose-700'
-              } disabled:opacity-50`}
+              } disabled:opacity-75`}
             >
-              <Check className="w-4 h-4" />
-              <span>{isSaving ? 'Menyimpan ke Cloud...' : 'Simpan & Terapkan Status'}</span>
+              {isSaving ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span>Menyimpan ke Cloud...</span>
+                </>
+              ) : (
+                <>
+                  <Check className="w-4 h-4" />
+                  <span>Simpan & Terapkan Status</span>
+                </>
+              )}
             </button>
           </div>
         </form>

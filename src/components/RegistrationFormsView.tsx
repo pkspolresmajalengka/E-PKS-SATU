@@ -28,7 +28,15 @@ import {
   LayoutList,
   Edit3,
   Save,
-  FileCheck2
+  FileCheck2,
+  User,
+  Users,
+  MapPin,
+  Trash2,
+  ChevronUp,
+  ChevronDown,
+  Plus,
+  Send
 } from 'lucide-react';
 import {
   saveRegistrationToCloud,
@@ -38,7 +46,9 @@ import {
   BlankoConfig,
   DEFAULT_BLANKO_CONFIG
 } from '../lib/firebase';
-import { AppUser } from '../App';
+import { AppUser, CalonPksStudentItem } from '../App';
+import { compressImageFile } from '../lib/imageUtils';
+import { NetworkErrorBanner, NetworkErrorState } from './NetworkErrorBanner';
 
 export type SchoolLevel = 'SLTP' | 'SLTA';
 
@@ -75,23 +85,9 @@ interface RegistrationFormsViewProps {
   handleExportFormPolisiPelajarExcel: () => void;
 
   formCalonPks: {
-    nama: string;
-    nisn: string;
     sekolah: string;
     jenjang: SchoolLevel;
-    kelas: string;
-    ttl: string;
-    jk: string;
-    agama: string;
-    alamat: string;
-    noHp: string;
-    namaPembina: string;
-    divisiMinat: string;
-    tinggiBadan: string;
-    beratBadan: string;
-    golDarah: string;
-    riwayatOrganisasi: string;
-    izinOrtu: boolean;
+    students: CalonPksStudentItem[];
   };
   setFormCalonPks: React.Dispatch<React.SetStateAction<any>>;
   handleExportFormCalonPksExcel: () => void;
@@ -163,7 +159,14 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
   const [proofFileName, setProofFileName] = useState<string>('');
   const [simulatedGatewaySuccess, setSimulatedGatewaySuccess] = useState(false);
   const [pendingSubmissionPayload, setPendingSubmissionPayload] = useState<any>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submittingAction, setSubmittingAction] = useState<'save_later' | 'pay_now' | 'pay_modal' | null>(null);
+  const isSubmitting = submittingAction !== null;
+  const [networkError, setNetworkError] = useState<NetworkErrorState | null>(null);
+  const [collapsedStudents, setCollapsedStudents] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    setNetworkError(null);
+  }, [currentTab, viewMode]);
 
   const formatRupiah = (val: number) => {
     return new Intl.NumberFormat('id-ID', {
@@ -197,6 +200,18 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
     return { fee: 0, isFree: true, description: '' };
   }, [currentTab, paymentConfig]);
 
+  const calonPksStudentCount = useMemo(() => {
+    return Math.max(1, formCalonPks.students?.length || 1);
+  }, [formCalonPks.students]);
+
+  const activeTotalFee = useMemo(() => {
+    if (currentFeeConfig.isFree) return 0;
+    if (currentTab === 'form_calon_pks') {
+      return (currentFeeConfig.fee || 0) * calonPksStudentCount;
+    }
+    return currentFeeConfig.fee || 0;
+  }, [currentFeeConfig, currentTab, calonPksStudentCount]);
+
   // My school submissions filter
   const mySchoolSubmissions = useMemo(() => {
     if (!currentUser) return submissionsList;
@@ -221,6 +236,7 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
     let schoolName = '';
     let schoolLevel: SchoolLevel = 'SLTP';
     let formData: any = null;
+    let computedFee = currentFeeConfig.isFree ? 0 : currentFeeConfig.fee;
 
     if (currentTab === 'form_polisi_pelajar') {
       formTitle = blankoConfig?.forms?.polisi_pelajar?.judul || 'Polisi Pelajar (Poljar)';
@@ -231,11 +247,50 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
       formData = { ...formPolisiPelajar };
     } else if (currentTab === 'form_calon_pks') {
       formTitle = blankoConfig?.forms?.calon_pks?.judul || 'Calon Anggota PKS';
-      formId = `calonpks-${formCalonPks.nisn || Date.now()}`;
-      applicantName = formCalonPks.nama.trim() || 'Calon Anggota PKS';
-      schoolName = formCalonPks.sekolah.trim() || currentUser?.schoolName || currentUser?.name || 'Sekolah';
+      schoolName = formCalonPks.sekolah.trim() || currentUser?.schoolName || currentUser?.name || '';
       schoolLevel = formCalonPks.jenjang || 'SLTA';
-      formData = { ...formCalonPks };
+
+      const students = formCalonPks.students || [];
+      if (students.length === 0) {
+        showToast('Minimal harus ada 1 data siswa yang didaftarkan!', 'error');
+        return null;
+      }
+
+      const emptyNameIdx = students.findIndex(st => !st.nama || !st.nama.trim());
+      if (emptyNameIdx !== -1) {
+        const targetId = students[emptyNameIdx].id;
+        setCollapsedStudents(prev => ({ ...prev, [targetId]: false }));
+        showToast(`Harap masukkan Nama Lengkap untuk Siswa ${emptyNameIdx + 1}!`, 'error');
+        return null;
+      }
+
+      if (!schoolName) {
+        showToast('Harap isi Nama Pangkalan Sekolah terlebih dahulu!', 'error');
+        return null;
+      }
+
+      const firstStudentName = students[0].nama.trim();
+      applicantName =
+        students.length === 1
+          ? firstStudentName
+          : `${firstStudentName} (+${students.length - 1} siswa lainnya)`;
+
+      const unitFee = currentFeeConfig.isFree ? 0 : currentFeeConfig.fee;
+      computedFee = unitFee * students.length;
+      formId = `calonpks-${Date.now()}`;
+      formData = {
+        sekolah: schoolName,
+        jenjang: schoolLevel,
+        studentCount: students.length,
+        unitFee,
+        students: students.map((st, idx) => ({
+          id: st.id || `siswa-${idx + 1}`,
+          nama: st.nama.trim(),
+          tempatLahir: st.tempatLahir.trim(),
+          tanggalLahir: st.tanggalLahir,
+          jk: st.jk || 'Laki-laki'
+        }))
+      };
     } else if (currentTab === 'form_perkemahan_balok1') {
       formTitle = blankoConfig?.forms?.kemah_balok1?.judul || 'Kemah PKS Balok 1';
       formId = `balok1-${Date.now()}`;
@@ -257,8 +312,6 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
       return null;
     }
 
-    const fee = currentFeeConfig.isFree ? 0 : currentFeeConfig.fee;
-
     return {
       id: formId,
       formType: currentTab.replace('form_', '').replace('perkemahan_', '') as any,
@@ -269,13 +322,13 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
       applicantName,
       contactWa: formData.noHp || formData.noHpPembina || currentUser?.contactWa || '',
       formData,
-      feeAmount: fee,
-      paymentMethod: fee === 0 ? 'free' : 'midtrans',
-      paymentStatus: fee === 0 ? 'paid' : 'unpaid',
+      feeAmount: computedFee,
+      paymentMethod: computedFee === 0 ? 'free' : 'midtrans',
+      paymentStatus: computedFee === 0 ? 'paid' : 'unpaid',
       stage1Finance: {
-        status: fee === 0 ? 'approved' : 'pending',
-        verifiedBy: fee === 0 ? 'Sistem (Bebas Biaya)' : undefined,
-        verifiedAt: fee === 0 ? new Date().toLocaleString('id-ID') : undefined
+        status: computedFee === 0 ? 'approved' : 'pending',
+        verifiedBy: computedFee === 0 ? 'Sistem (Bebas Biaya)' : undefined,
+        verifiedAt: computedFee === 0 ? new Date().toLocaleString('id-ID') : undefined
       },
       stage2Committee: {
         status: 'pending'
@@ -286,25 +339,65 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
   };
 
   // Action: Simpan Dulu (Bayar Nanti)
+  const submitDraftPayload = async (payload: RegistrationSubmission) => {
+    setSubmittingAction('save_later');
+    setNetworkError(null);
+    try {
+      const res = await saveRegistrationToCloud(payload);
+      if (res.success || res.queuedOffline) {
+        showToast(
+          res.queuedOffline
+            ? `Data pendaftaran "${payload.applicantName}" disimpan offline & akan otomatis dikirim ke Cloud saat online.`
+            : `Data pendaftaran "${payload.applicantName}" berhasil disimpan ke Cloud! Anda dapat membayarnya nanti di menu Riwayat & Tagihan Sekolah.`,
+          res.queuedOffline ? 'info' : 'success'
+        );
+        setViewMode('my_submissions');
+      } else {
+        setNetworkError({
+          title: 'Gagal Menyimpan Draf Pendaftaran ke Cloud',
+          message: res.error || 'Terjadi gangguan jaringan saat mengirim data pendaftaran.',
+          isNetworkError: res.isNetworkError,
+          onRetry: () => submitDraftPayload(payload)
+        });
+        showToast(`Gagal menyimpan data: ${res.error}`, 'error');
+      }
+    } finally {
+      setSubmittingAction(null);
+    }
+  };
+
   const handleSaveForLater = async () => {
     const payload = getFormSubmissionPayload();
     if (!payload) return;
 
     payload.paymentStatus = 'unpaid';
-    setIsSubmitting(true);
+    await submitDraftPayload(payload);
+  };
+
+  const submitFreeRegistrationPayload = async (basePayload: RegistrationSubmission) => {
+    setSubmittingAction('pay_now');
+    setNetworkError(null);
     try {
-      const res = await saveRegistrationToCloud(payload);
-      if (res.success) {
+      const res = await saveRegistrationToCloud(basePayload);
+      if (res.success || res.queuedOffline) {
         showToast(
-          `Data pendaftaran "${payload.applicantName}" berhasil disimpan ke Cloud! Anda dapat membayarnya nanti di menu Riwayat & Tagihan Sekolah.`,
-          'success'
+          res.queuedOffline
+            ? `Pendaftaran "${basePayload.applicantName}" disimpan offline & akan otomatis tersinkron saat online.`
+            : `Pendaftaran "${basePayload.formTitle}" untuk "${basePayload.applicantName}" berhasil dikirim ke panitia!`,
+          res.queuedOffline ? 'info' : 'success'
         );
         setViewMode('my_submissions');
       } else {
-        showToast(`Gagal menyimpan data: ${res.error}`, 'error');
+        setNetworkError({
+          title: 'Gagal Mengirim Formulir Pendaftaran ke Cloud',
+          message: res.error || 'Terjadi gangguan jaringan saat mengirim formulir pendaftaran.',
+          isNetworkError: res.isNetworkError,
+          onRetry: () => submitFreeRegistrationPayload(basePayload)
+        });
+        showToast(`Gagal mengirim pendaftaran: ${res.error}`, 'error');
       }
     } finally {
-      setIsSubmitting(false);
+      setSubmittingAction(null);
     }
   };
 
@@ -313,26 +406,14 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
     const basePayload = getFormSubmissionPayload();
     if (!basePayload) return;
 
-    const fee = currentFeeConfig.isFree ? 0 : currentFeeConfig.fee;
+    const fee = basePayload.feeAmount;
 
     if (fee === 0) {
       // Free form -> save immediately
-      (async () => {
-        setIsSubmitting(true);
-        try {
-          const res = await saveRegistrationToCloud(basePayload);
-          if (res.success) {
-            showToast(`Pendaftaran "${basePayload.formTitle}" untuk "${basePayload.applicantName}" berhasil dikirim ke panitia!`, 'success');
-            setViewMode('my_submissions');
-          } else {
-            showToast(`Gagal mengirim pendaftaran: ${res.error}`, 'error');
-          }
-        } finally {
-          setIsSubmitting(false);
-        }
-      })();
+      void submitFreeRegistrationPayload(basePayload);
     } else {
       // Paid form -> open payment modal
+      setNetworkError(null);
       setPendingSubmissionPayload(basePayload);
       setPayNowChoice('pay_now');
       setProofFileBase64('');
@@ -343,7 +424,7 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
   };
 
   // Proof image upload for manual bank transfer or static QRIS
-  const handleProofImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleProofImageChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -352,73 +433,94 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
       return;
     }
 
-    if (file.size > 3 * 1024 * 1024) {
-      showToast('Ukuran berkas maksimal 3 MB!', 'error');
+    if (file.size > 6 * 1024 * 1024) {
+      showToast('Ukuran berkas maksimal 6 MB!', 'error');
       return;
     }
 
-    setProofFileName(file.name);
-    const reader = new FileReader();
-    reader.onload = event => {
-      setProofFileBase64(event.target?.result as string);
-    };
-    reader.readAsDataURL(file);
+    try {
+      const compressed = await compressImageFile(file, {
+        maxDimension: 1280,
+        maxDataUrlBytes: 550 * 1024
+      });
+      setProofFileName(file.name);
+      setProofFileBase64(compressed);
+    } catch (err: any) {
+      showToast(err?.message || 'Gagal memproses foto bukti pembayaran.', 'error');
+    }
   };
 
   // Finalize Submission & Payment
-  const handleConfirmPaymentAndSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!pendingSubmissionPayload) return;
-
-    setIsSubmitting(true);
+  const submitFinalPaymentPayload = async (finalSubmission: RegistrationSubmission) => {
+    setSubmittingAction('pay_modal');
+    setNetworkError(null);
     try {
-      let finalSubmission: RegistrationSubmission = { ...pendingSubmissionPayload };
-
-      if (payNowChoice === 'pay_later') {
-        finalSubmission.paymentStatus = 'unpaid';
-        finalSubmission.paymentMethod = selectedPayMethod;
-      } else {
-        finalSubmission.paymentMethod = selectedPayMethod;
-
-        if (selectedPayMethod === 'bank_transfer' || selectedPayMethod === 'qris') {
-          if (!proofFileBase64) {
-            showToast('Harap unggah foto bukti transfer atau struk scan QRIS!', 'error');
-            setIsSubmitting(false);
-            return;
-          }
-          finalSubmission.paymentStatus = 'pending_verification';
-          finalSubmission.paymentProofUrl = proofFileBase64;
-          finalSubmission.paymentProofFileName = proofFileName;
-          finalSubmission.paymentDate = new Date().toLocaleString('id-ID');
-        } else {
-          // Midtrans or Ratapay Gateway
-          finalSubmission.paymentStatus = 'pending_verification';
-          finalSubmission.paymentReference = `${selectedPayMethod.toUpperCase()}-${Date.now()}`;
-          finalSubmission.paymentDate = new Date().toLocaleString('id-ID');
-        }
-      }
-
-      finalSubmission.updatedAt = new Date().toISOString();
-
       const res = await saveRegistrationToCloud(finalSubmission);
-      if (res.success) {
+      if (res.success || res.queuedOffline) {
         showToast(
-          payNowChoice === 'pay_later'
+          res.queuedOffline
+            ? `Berkas pendaftaran disimpan offline & otomatis dikirim ke Cloud saat koneksi aktif.`
+            : payNowChoice === 'pay_later'
             ? `Berkas pendaftaran tersimpan! Anda dapat membayarnya nanti di menu Riwayat Pengajuan.`
             : `Pendaftaran & bukti pembayaran berhasil dikirim! Menunggu verifikasi 2-tahap panitia.`,
-          'success'
+          res.queuedOffline ? 'info' : 'success'
         );
         setPaymentModalOpen(false);
         setPendingSubmissionPayload(null);
         setViewMode('my_submissions');
       } else {
+        setNetworkError({
+          title: 'Gagal Menyimpan Pendaftaran ke Cloud',
+          message: res.error || 'Terjadi gangguan jaringan saat mengirim formulir & pembayaran.',
+          isNetworkError: res.isNetworkError,
+          onRetry: () => submitFinalPaymentPayload(finalSubmission)
+        });
         showToast(`Gagal menyimpan ke Cloud: ${res.error}`, 'error');
       }
     } catch (err: any) {
+      setNetworkError({
+        title: 'Gagal Menyimpan Pendaftaran',
+        message: err?.message || 'Terjadi kesalahan jaringan saat mengirim data.',
+        isNetworkError: true,
+        onRetry: () => submitFinalPaymentPayload(finalSubmission)
+      });
       showToast(`Terjadi kesalahan: ${err.message}`, 'error');
     } finally {
-      setIsSubmitting(false);
+      setSubmittingAction(null);
     }
+  };
+
+  const handleConfirmPaymentAndSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!pendingSubmissionPayload) return;
+
+    let finalSubmission: RegistrationSubmission = { ...pendingSubmissionPayload };
+
+    if (payNowChoice === 'pay_later') {
+      finalSubmission.paymentStatus = 'unpaid';
+      finalSubmission.paymentMethod = selectedPayMethod;
+    } else {
+      finalSubmission.paymentMethod = selectedPayMethod;
+
+      if (selectedPayMethod === 'bank_transfer' || selectedPayMethod === 'qris') {
+        if (!proofFileBase64) {
+          showToast('Harap unggah foto bukti transfer atau struk scan QRIS!', 'error');
+          return;
+        }
+        finalSubmission.paymentStatus = 'pending_verification';
+        finalSubmission.paymentProofUrl = proofFileBase64;
+        finalSubmission.paymentProofFileName = proofFileName;
+        finalSubmission.paymentDate = new Date().toLocaleString('id-ID');
+      } else {
+        // Midtrans or Ratapay Gateway
+        finalSubmission.paymentStatus = 'pending_verification';
+        finalSubmission.paymentReference = `${selectedPayMethod.toUpperCase()}-${Date.now()}`;
+        finalSubmission.paymentDate = new Date().toLocaleString('id-ID');
+      }
+    }
+
+    finalSubmission.updatedAt = new Date().toISOString();
+    await submitFinalPaymentPayload(finalSubmission);
   };
 
   const isSavingCloud = isSubmitting;
@@ -474,49 +576,53 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
   };
 
   const handleResetCalonPks = () => {
+    const defaultSchool = currentUser?.role === 'sekolah' ? (currentUser.schoolName || currentUser.name || '') : '';
+    const defaultLevel: SchoolLevel = currentUser?.role === 'sekolah' ? (currentUser.schoolLevel || 'SLTP') : 'SLTA';
     setFormCalonPks({
-      nama: '',
-      nisn: '',
-      sekolah: '',
-      jenjang: 'SLTA',
-      kelas: '',
-      ttl: '',
-      jk: 'Perempuan',
-      agama: 'Islam',
-      alamat: '',
-      noHp: '',
-      namaPembina: '',
-      divisiMinat: 'Gatur Lantas & Keselamatan Jalan',
-      tinggiBadan: '',
-      beratBadan: '',
-      golDarah: 'A',
-      riwayatOrganisasi: '',
-      izinOrtu: true
+      sekolah: defaultSchool,
+      jenjang: defaultLevel,
+      students: [
+        {
+          id: `siswa-${Date.now()}`,
+          nama: '',
+          tempatLahir: '',
+          tanggalLahir: '',
+          jk: 'Laki-laki'
+        }
+      ]
     });
-    showToast('Formulir Calon Anggota PKS dikosongkan.', 'info');
+    setCollapsedStudents({});
+    showToast('Formulir Pendaftaran Calon PKS dikosongkan.', 'info');
   };
 
   const handleDemoCalonPks = () => {
+    const demoSchool =
+      currentUser?.role === 'sekolah'
+        ? currentUser.schoolName || currentUser.name || 'SMA Negeri 1 Majalengka'
+        : 'SMA Negeri 1 Majalengka';
+    const demoLevel: SchoolLevel = currentUser?.role === 'sekolah' ? currentUser.schoolLevel || 'SLTA' : 'SLTA';
     setFormCalonPks({
-      nama: 'Aisyah Putri Rahmadani',
-      nisn: '0078129845',
-      sekolah: 'SMA Negeri 1 Majalengka',
-      jenjang: 'SLTA',
-      kelas: 'X-MIPA 2',
-      ttl: 'Majalengka, 22 April 2010',
-      jk: 'Perempuan',
-      agama: 'Islam',
-      alamat: 'Jl. Kartini No. 12, Majalengka',
-      noHp: '085712348900',
-      namaPembina: 'Drs. Supriyadi, M.Pd',
-      divisiMinat: 'Gatur Lantas & Keselamatan Jalan',
-      tinggiBadan: '160',
-      beratBadan: '48',
-      golDarah: 'A',
-      riwayatOrganisasi: 'Pramuka Penggalang Inti',
-      izinOrtu: true
+      sekolah: demoSchool,
+      jenjang: demoLevel,
+      students: [
+        {
+          id: 'siswa-demo-1',
+          nama: 'Aisyah Putri Rahmadani',
+          tempatLahir: 'Majalengka',
+          tanggalLahir: '2010-04-22',
+          jk: 'Perempuan'
+        },
+        {
+          id: 'siswa-demo-2',
+          nama: 'Bintang Pratama',
+          tempatLahir: 'Majalengka',
+          tanggalLahir: '2010-08-15',
+          jk: 'Laki-laki'
+        }
+      ]
     });
-    showToast('Contoh data Calon PKS berhasil dimuat.');
+    setCollapsedStudents({});
+    showToast('Contoh 2 data siswa Calon PKS berhasil dimuat.');
   };
 
   const handleResetBalok1 = () => {
@@ -686,6 +792,11 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
 
       {viewMode === 'form' ? (
         <>
+          <NetworkErrorBanner
+            error={networkError}
+            onDismiss={() => setNetworkError(null)}
+            className="no-print"
+          />
           {/* FEE SUMMARY BANNER */}
           <div className="no-print bg-linear-to-r from-blue-50 via-indigo-50 to-white p-4 sm:p-5 rounded-2xl border border-blue-200/80 shadow-xs flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
             <div className="space-y-1">
@@ -700,12 +811,15 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
                   {currentTab === 'form_perkemahan_balok2' && '4. Ujian PKS Balok 2'}
                 </span>
               </div>
-              <div className="flex items-baseline gap-2">
-                <span className="text-xl sm:text-2xl font-black text-slate-900">
-                  {currentFeeConfig.isFree ? 'Gratis (Bebas Biaya)' : formatRupiah(currentFeeConfig.fee)}
+              <div className="flex flex-wrap items-baseline gap-2">
+                <span className="text-xl sm:text-2xl font-black text-slate-900 tabular-nums">
+                  {currentFeeConfig.isFree ? 'Gratis (Bebas Biaya)' : formatRupiah(activeTotalFee)}
                 </span>
                 <span className="text-xs text-slate-500 font-medium">
-                  {currentFeeConfig.description || (currentFeeConfig.isFree ? 'Tanpa biaya pendaftaran panitia' : 'Per peserta/regu terdaftar')}
+                  {currentTab === 'form_calon_pks' && !currentFeeConfig.isFree
+                    ? `(${formatRupiah(currentFeeConfig.fee)} × ${calonPksStudentCount} Siswa)`
+                    : currentFeeConfig.description ||
+                      (currentFeeConfig.isFree ? 'Tanpa biaya pendaftaran panitia' : 'Per peserta/regu terdaftar')}
                 </span>
               </div>
               <p className="text-xs text-slate-600">
@@ -1213,10 +1327,19 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
                           type="button"
                           onClick={handleSaveForLater}
                           disabled={isSubmitting}
-                          className="w-full sm:w-auto px-4 py-2.5 rounded-xl border border-slate-600 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center justify-center gap-2 transition cursor-pointer shadow-xs"
+                          className="w-full sm:w-auto px-4 py-2.5 rounded-xl border border-slate-600 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 text-xs font-bold flex items-center justify-center gap-2 transition cursor-pointer shadow-xs"
                         >
-                          <Save className="w-4 h-4 text-slate-400" />
-                          <span>Simpan Dulu (Bayar Nanti)</span>
+                          {submittingAction === 'save_later' ? (
+                            <>
+                              <Loader2 className="w-4 h-4 animate-spin text-slate-300" />
+                              <span>Menyimpan...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Save className="w-4 h-4 text-slate-400" />
+                              <span>Simpan Dulu (Bayar Nanti)</span>
+                            </>
+                          )}
                         </button>
 
                         <button
@@ -1243,328 +1366,409 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
                 </div>
               )}
 
-              {/* COMPACT FORM 2: CALON PKS */}
-              {currentTab === 'form_calon_pks' && (
-                <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-5 sm:p-6 space-y-5">
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-slate-200 gap-2">
-                    <div className="flex items-center gap-3">
-                      <div className="p-2.5 bg-indigo-100 text-indigo-700 rounded-xl">
-                        <UserCheck className="w-5 h-5" />
-                      </div>
-                      <div>
-                        <h3 className="font-extrabold text-base text-slate-900">
-                          Formulir Biodata Calon Anggota PKS
-                        </h3>
-                        <p className="text-xs text-slate-500">
-                          Input mandiri calon anggota Patroli Keamanan Sekolah (PKS) pangkalan.
-                        </p>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="px-2.5 py-1 rounded-lg text-xs font-black bg-indigo-50 text-indigo-700 border border-indigo-200">
-                        {formCalonPks.jenjang}
-                      </span>
-                      <span className="px-2.5 py-1 rounded-lg text-xs font-bold bg-slate-100 text-slate-700">
-                        {formCalonPks.sekolah || 'Pangkalan Belum Diisi'}
-                      </span>
-                    </div>
-                  </div>
+              {/* COMPACT FORM 2: CALON PKS (MULTI-SISWA SESUAI REFERENSI) */}
+              {currentTab === 'form_calon_pks' && (() => {
+                const students = formCalonPks.students || [];
+                const unitFee = currentFeeConfig.isFree ? 0 : currentFeeConfig.fee || 0;
+                const totalFee = unitFee * Math.max(1, students.length);
 
-                  {/* Section A: Identitas Calon PKS */}
-                  <div className="space-y-3">
-                    <h4 className="text-xs font-bold uppercase tracking-wider text-indigo-900 border-b border-indigo-100 pb-1.5 flex items-center gap-1.5">
-                      <span className="w-2 h-2 rounded-full bg-indigo-600"></span>
-                      <span>A. Biodata Calon Anggota PKS</span>
-                    </h4>
+                const handleAddStudent = () => {
+                  const newId = `siswa-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+                  setFormCalonPks((prev: any) => ({
+                    ...prev,
+                    students: [
+                      ...(prev.students || []),
+                      {
+                        id: newId,
+                        nama: '',
+                        tempatLahir: '',
+                        tanggalLahir: '',
+                        jk: 'Laki-laki'
+                      }
+                    ]
+                  }));
+                };
 
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 text-xs">
-                      <div>
-                        <label className="block text-slate-700 font-bold mb-1">Nama Lengkap Siswa *</label>
-                        <input
-                          type="text"
-                          value={formCalonPks.nama}
-                          onChange={e => setFormCalonPks({ ...formCalonPks, nama: e.target.value })}
-                          className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs font-semibold outline-none focus:ring-2 focus:ring-indigo-500"
-                          placeholder="Nama lengkap..."
-                        />
-                      </div>
+                const handleRemoveStudent = (targetId: string) => {
+                  if (students.length <= 1) {
+                    showToast('Minimal harus terdapat 1 formulir siswa.', 'info');
+                    return;
+                  }
+                  setFormCalonPks((prev: any) => ({
+                    ...prev,
+                    students: (prev.students || []).filter((s: CalonPksStudentItem) => s.id !== targetId)
+                  }));
+                };
 
-                      <div>
-                        <label className="block text-slate-700 font-bold mb-1">NISN *</label>
-                        <input
-                          type="text"
-                          value={formCalonPks.nisn}
-                          onChange={e => setFormCalonPks({ ...formCalonPks, nisn: e.target.value })}
-                          className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs font-mono outline-none focus:ring-2 focus:ring-indigo-500"
-                          placeholder="0089123456"
-                        />
-                      </div>
+                const handleUpdateStudent = (targetId: string, patch: Partial<CalonPksStudentItem>) => {
+                  setFormCalonPks((prev: any) => ({
+                    ...prev,
+                    students: (prev.students || []).map((s: CalonPksStudentItem) =>
+                      s.id === targetId ? { ...s, ...patch } : s
+                    )
+                  }));
+                };
 
-                      <div>
-                        <label className="block text-slate-700 font-bold mb-1">No. WhatsApp Siswa</label>
-                        <input
-                          type="text"
-                          value={formCalonPks.noHp}
-                          onChange={e => setFormCalonPks({ ...formCalonPks, noHp: e.target.value })}
-                          className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs font-mono outline-none focus:ring-2 focus:ring-indigo-500"
-                          placeholder="081234567890"
-                        />
-                      </div>
+                const toggleCollapse = (targetId: string) => {
+                  setCollapsedStudents(prev => ({
+                    ...prev,
+                    [targetId]: !prev[targetId]
+                  }));
+                };
 
-                      <div>
-                        <label className="block text-slate-700 font-bold mb-1">Pangkalan Sekolah</label>
-                        <input
-                          type="text"
-                          value={formCalonPks.sekolah}
-                          onChange={e => setFormCalonPks({ ...formCalonPks, sekolah: e.target.value })}
-                          className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs font-semibold outline-none focus:ring-2 focus:ring-indigo-500"
-                          placeholder="Asal sekolah..."
-                        />
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-2">
-                        <div>
-                          <label className="block text-slate-700 font-bold mb-1">Jenjang</label>
-                          <select
-                            value={formCalonPks.jenjang}
-                            onChange={e => setFormCalonPks({ ...formCalonPks, jenjang: e.target.value as SchoolLevel })}
-                            className="w-full px-2.5 py-2 border border-slate-300 rounded-xl text-xs bg-white font-bold outline-none focus:ring-2 focus:ring-indigo-500"
-                          >
-                            <option value="SLTP">SLTP</option>
-                            <option value="SLTA">SLTA</option>
-                          </select>
+                return (
+                  <div className="max-w-3xl mx-auto rounded-3xl overflow-hidden shadow-lg border border-blue-200/80 bg-white">
+                    {/* Header Biru Resmi Aplikasi PKS */}
+                    <div className="bg-gradient-to-br from-blue-700 via-blue-600 to-blue-800 px-5 sm:px-7 py-5 text-white relative overflow-hidden">
+                      <div className="flex items-center justify-between gap-4">
+                        <div className="flex items-center gap-3.5">
+                          <div className="w-12 h-12 rounded-2xl bg-white/15 border border-white/25 backdrop-blur-xs flex items-center justify-center shrink-0 shadow-inner">
+                            {appLogo ? (
+                              <img
+                                src={appLogo}
+                                alt="Logo PKS"
+                                className="w-9 h-9 object-contain"
+                                referrerPolicy="no-referrer"
+                              />
+                            ) : (
+                              <Shield className="w-6 h-6 text-white" />
+                            )}
+                          </div>
+                          <div>
+                            <p className="text-[11px] font-semibold text-blue-100 tracking-wide uppercase">
+                              Korps Patroli Keamanan Sekolah · Point 2
+                            </p>
+                            <h3 className="text-lg sm:text-xl font-black tracking-tight text-white leading-snug">
+                              Pendaftaran Siswa
+                            </h3>
+                            <p className="text-xs text-blue-100/90 mt-0.5">
+                              Silakan lengkapi data diri siswa calon anggota PKS yang akan didaftarkan.
+                            </p>
+                          </div>
                         </div>
-                        <div>
-                          <label className="block text-slate-700 font-bold mb-1">Kelas</label>
-                          <input
-                            type="text"
-                            value={formCalonPks.kelas}
-                            onChange={e => setFormCalonPks({ ...formCalonPks, kelas: e.target.value })}
-                            className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs outline-none focus:ring-2 focus:ring-indigo-500"
-                            placeholder="VII-A / X-1"
-                          />
-                        </div>
-                      </div>
 
-                      <div>
-                        <label className="block text-slate-700 font-bold mb-1">Tempat, Tanggal Lahir</label>
-                        <input
-                          type="text"
-                          value={formCalonPks.ttl}
-                          onChange={e => setFormCalonPks({ ...formCalonPks, ttl: e.target.value })}
-                          className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs outline-none focus:ring-2 focus:ring-indigo-500"
-                          placeholder="Majalengka, 15 Januari 2012"
-                        />
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-2">
-                        <div>
-                          <label className="block text-slate-700 font-bold mb-1">Jenis Kelamin</label>
-                          <select
-                            value={formCalonPks.jk}
-                            onChange={e => setFormCalonPks({ ...formCalonPks, jk: e.target.value })}
-                            className="w-full px-2.5 py-2 border border-slate-300 rounded-xl text-xs bg-white outline-none focus:ring-2 focus:ring-indigo-500"
-                          >
-                            <option value="Laki-Laki">Laki-Laki</option>
-                            <option value="Perempuan">Perempuan</option>
-                          </select>
-                        </div>
-                        <div>
-                          <label className="block text-slate-700 font-bold mb-1">Agama</label>
-                          <select
-                            value={formCalonPks.agama}
-                            onChange={e => setFormCalonPks({ ...formCalonPks, agama: e.target.value })}
-                            className="w-full px-2.5 py-2 border border-slate-300 rounded-xl text-xs bg-white outline-none focus:ring-2 focus:ring-indigo-500"
-                          >
-                            <option value="Islam">Islam</option>
-                            <option value="Kristen">Kristen</option>
-                            <option value="Katolik">Katolik</option>
-                            <option value="Hindu">Hindu</option>
-                            <option value="Buddha">Buddha</option>
-                            <option value="Konghucu">Konghucu</option>
-                          </select>
-                        </div>
-                      </div>
-
-                      <div className="sm:col-span-2 lg:col-span-2">
-                        <label className="block text-slate-700 font-bold mb-1">Alamat Rumah Lengkap</label>
-                        <input
-                          type="text"
-                          value={formCalonPks.alamat}
-                          onChange={e => setFormCalonPks({ ...formCalonPks, alamat: e.target.value })}
-                          className="w-full px-3 py-2 border border-slate-300 rounded-xl text-xs outline-none focus:ring-2 focus:ring-indigo-500"
-                          placeholder="Alamat rumah tinggal..."
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Section B: Minat & Pembina */}
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 pt-2">
-                    <div className="p-4 bg-slate-50/70 border border-slate-200 rounded-xl space-y-3">
-                      <h4 className="text-xs font-bold uppercase tracking-wider text-slate-800 flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full bg-slate-600"></span>
-                        <span>B. Pembina & Minat Korps PKS</span>
-                      </h4>
-                      <div className="space-y-2 text-xs">
-                        <div>
-                          <label className="block text-slate-600 font-bold mb-1">Nama Guru Pembina PKS</label>
-                          <input
-                            type="text"
-                            value={formCalonPks.namaPembina}
-                            onChange={e => setFormCalonPks({ ...formCalonPks, namaPembina: e.target.value })}
-                            className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs bg-white outline-none focus:ring-2 focus:ring-indigo-500 font-semibold"
-                            placeholder="Nama guru pembina pangkalan..."
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-slate-600 font-bold mb-1">Divisi Minat PKS</label>
-                          <select
-                            value={formCalonPks.divisiMinat}
-                            onChange={e => setFormCalonPks({ ...formCalonPks, divisiMinat: e.target.value })}
-                            className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg text-xs bg-white font-semibold outline-none focus:ring-2 focus:ring-indigo-500"
-                          >
-                            <option value="Gatur Lantas & Keselamatan Jalan">Gatur Lantas & Keselamatan Jalan</option>
-                            <option value="PBB & Tata Upacara Bendera">PBB & Tata Upacara Bendera</option>
-                            <option value="Keamanan & Ketertiban Lingkungan Sekolah">Keamanan & Ketertiban Lingkungan Sekolah</option>
-                            <option value="Pertolongan Pertama (P3K) & SAR">Pertolongan Pertama (P3K) & SAR</option>
-                          </select>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="p-4 bg-slate-50/70 border border-slate-200 rounded-xl space-y-3">
-                      <h4 className="text-xs font-bold uppercase tracking-wider text-slate-800 flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full bg-slate-600"></span>
-                        <span>C. Fisik & Pengalaman Organisasi</span>
-                      </h4>
-                      <div className="grid grid-cols-3 gap-2 text-xs">
-                        <div>
-                          <label className="block text-slate-600 font-bold mb-1">Tinggi (cm)</label>
-                          <input
-                            type="number"
-                            value={formCalonPks.tinggiBadan}
-                            onChange={e => setFormCalonPks({ ...formCalonPks, tinggiBadan: e.target.value })}
-                            className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg text-xs bg-white outline-none focus:ring-2 focus:ring-indigo-500"
-                            placeholder="168"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-slate-600 font-bold mb-1">Berat (kg)</label>
-                          <input
-                            type="number"
-                            value={formCalonPks.beratBadan}
-                            onChange={e => setFormCalonPks({ ...formCalonPks, beratBadan: e.target.value })}
-                            className="w-full px-2.5 py-1.5 border border-slate-300 rounded-lg text-xs bg-white outline-none focus:ring-2 focus:ring-indigo-500"
-                            placeholder="55"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-slate-600 font-bold mb-1">Gol. Darah</label>
-                          <select
-                            value={formCalonPks.golDarah}
-                            onChange={e => setFormCalonPks({ ...formCalonPks, golDarah: e.target.value })}
-                            className="w-full px-2 py-1.5 border border-slate-300 rounded-lg text-xs bg-white outline-none focus:ring-2 focus:ring-indigo-500 font-bold"
-                          >
-                            <option value="A">A</option>
-                            <option value="B">B</option>
-                            <option value="AB">AB</option>
-                            <option value="O">O</option>
-                            <option value="-">-</option>
-                          </select>
-                        </div>
-                      </div>
-                      <div>
-                        <label className="block text-slate-600 font-bold mb-1">Riwayat Organisasi / Ekstrakurikuler</label>
-                        <input
-                          type="text"
-                          value={formCalonPks.riwayatOrganisasi}
-                          onChange={e => setFormCalonPks({ ...formCalonPks, riwayatOrganisasi: e.target.value })}
-                          className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs bg-white outline-none focus:ring-2 focus:ring-indigo-500"
-                          placeholder="Pramuka / PMR / OSIS..."
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Section D: Pernyataan & Izin Ortu */}
-                  <div className="bg-indigo-50/60 border border-indigo-200 p-4 rounded-xl text-xs space-y-2">
-                    <label className="flex items-start gap-2.5 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={formCalonPks.izinOrtu}
-                        onChange={e => setFormCalonPks({ ...formCalonPks, izinOrtu: e.target.checked })}
-                        className="mt-0.5 w-4 h-4 text-indigo-600 rounded border-slate-300"
-                      />
-                      <span className="text-slate-800 leading-relaxed">
-                        <strong>Persetujuan & Izin Tertulis:</strong> Telah mendapatkan izin dari orang tua/wali serta bersedia mengikuti seluruh tahapan diklat disiplin kepolisian dan mentaati norma Tri Siap dan Panca PKS.
-                      </span>
-                    </label>
-                  </div>
-
-                  {/* BOTTOM ACTION BAR (LANJUT BAYAR) */}
-                  <div className="pt-4 border-t border-slate-200">
-                    <div className="bg-gradient-to-r from-slate-900 via-slate-800 to-indigo-950 text-white p-4 sm:p-5 rounded-2xl flex flex-col md:flex-row items-center justify-between gap-4 shadow-md">
-                      <div className="space-y-1 text-center md:text-left">
-                        <div className="flex items-center justify-center md:justify-start gap-2">
-                          <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                            Status Siap Simpan
-                          </span>
-                          <span className="text-xs text-slate-300 font-semibold">
-                            Biaya Registrasi: {currentFeeConfig.isFree ? 'Gratis' : formatRupiah(currentFeeConfig.fee)}
+                        <div className="hidden sm:flex flex-col items-end text-right shrink-0">
+                          <span className="text-[11px] font-semibold text-blue-100">Total Siswa</span>
+                          <span className="text-xl font-black text-white tabular-nums">
+                            {students.length} Siswa
                           </span>
                         </div>
-                        <h4 className="text-sm sm:text-base font-extrabold text-white">
-                          Simpan Formulir & Lanjut ke Pembayaran
-                        </h4>
-                        <p className="text-xs text-slate-300 max-w-lg">
-                          Data tersimpan langsung ke cloud database panitia. Anda dapat langsung membayar atau memilih bayar nanti.
-                        </p>
+                      </div>
+                    </div>
+
+                    {/* Body Formulir */}
+                    <div className="p-5 sm:p-7 space-y-5 bg-white">
+                      {/* Identitas Pangkalan Sekolah di Bagian Atas */}
+                      <div className="bg-blue-50/60 border border-blue-200/80 rounded-2xl p-4 space-y-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2 text-xs font-extrabold text-blue-950">
+                            <Building2 className="w-4 h-4 text-blue-600 shrink-0" />
+                            <span>Info Pangkalan Sekolah</span>
+                          </div>
+                          {currentUser?.role === 'sekolah' && (
+                            <span className="text-[11px] font-semibold text-blue-700">
+                              Terisi otomatis dari akun sekolah
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                          <div className="sm:col-span-2">
+                            <label className="block text-slate-700 font-bold mb-1">
+                              Nama Pangkalan / Sekolah *
+                            </label>
+                            <input
+                              type="text"
+                              value={formCalonPks.sekolah}
+                              onChange={e => setFormCalonPks({ ...formCalonPks, sekolah: e.target.value })}
+                              className="w-full px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl text-xs sm:text-sm font-semibold text-slate-900 outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition"
+                              placeholder="Contoh: SMA Negeri 1 Majalengka"
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-slate-700 font-bold mb-1">
+                              Jenjang Sekolah *
+                            </label>
+                            <select
+                              value={formCalonPks.jenjang}
+                              onChange={e =>
+                                setFormCalonPks({ ...formCalonPks, jenjang: e.target.value as SchoolLevel })
+                              }
+                              className="w-full px-3 py-2.5 bg-white border border-slate-300 rounded-xl text-xs sm:text-sm font-bold text-slate-900 outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition"
+                            >
+                              <option value="SLTP">SLTP (SMP / MTs)</option>
+                              <option value="SLTA">SLTA (SMA / SMK / MA)</option>
+                            </select>
+                          </div>
+                        </div>
                       </div>
 
-                      <div className="flex flex-col sm:flex-row items-center gap-2 w-full md:w-auto shrink-0">
-                        <button
-                          type="button"
-                          onClick={() => setFormDisplayMode('blanko')}
-                          className="w-full sm:w-auto px-3.5 py-2.5 rounded-xl border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
-                        >
-                          <FileText className="w-3.5 h-3.5 text-indigo-400" />
-                          <span>Lihat Blanko A4</span>
-                        </button>
+                      {/* Sub-header "| Data Siswa" */}
+                      <div className="flex items-center justify-between pt-1">
+                        <div className="flex items-center gap-2.5">
+                          <span className="w-1 h-5 rounded-full bg-blue-600 shrink-0" aria-hidden="true" />
+                          <h4 className="text-sm sm:text-base font-extrabold text-slate-900">
+                            Data Siswa
+                          </h4>
+                        </div>
+                        <span className="text-xs font-semibold text-slate-500 tabular-nums">
+                          {students.length} Pendaftar
+                        </span>
+                      </div>
 
-                        <button
-                          type="button"
-                          onClick={handleSaveForLater}
-                          disabled={isSubmitting}
-                          className="w-full sm:w-auto px-4 py-2.5 rounded-xl border border-slate-600 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center justify-center gap-2 transition cursor-pointer shadow-xs"
-                        >
-                          <Save className="w-4 h-4 text-slate-400" />
-                          <span>Simpan Dulu (Bayar Nanti)</span>
-                        </button>
+                      {/* Daftar Kartu Siswa Berulang */}
+                      <div className="space-y-4">
+                        {students.map((student, idx) => {
+                          const isCollapsed = Boolean(collapsedStudents[student.id]);
+                          return (
+                            <div
+                              key={student.id}
+                              className="rounded-2xl border border-slate-200 bg-slate-50/50 transition-all overflow-hidden"
+                            >
+                              {/* Bar Atas Kartu: Badge Siswa # + Hapus + Collapse */}
+                              <div className="px-4 py-3 flex items-center justify-between gap-3 border-b border-slate-200/70 bg-white/80">
+                                <div className="flex items-center gap-2.5 min-w-0">
+                                  <span className="px-3 py-1 rounded-lg bg-blue-100 text-blue-700 text-xs font-extrabold shrink-0 tabular-nums">
+                                    Siswa {idx + 1}
+                                  </span>
+                                  {isCollapsed && (
+                                    <span className="text-xs font-semibold text-slate-700 truncate">
+                                      {student.nama.trim() || 'Belum diisi nama'}
+                                      {student.jk ? ` · ${student.jk}` : ''}
+                                    </span>
+                                  )}
+                                </div>
+
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  {students.length > 1 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRemoveStudent(student.id)}
+                                      title={`Hapus Siswa ${idx + 1}`}
+                                      className="p-2 rounded-lg text-rose-600 hover:bg-rose-50 transition cursor-pointer"
+                                    >
+                                      <Trash2 className="w-4 h-4" />
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => toggleCollapse(student.id)}
+                                    title={isCollapsed ? 'Buka Detail Siswa' : 'Lipat Detail Siswa'}
+                                    className="p-2 rounded-lg text-slate-500 hover:bg-slate-100 hover:text-slate-800 transition cursor-pointer"
+                                  >
+                                    {isCollapsed ? (
+                                      <ChevronDown className="w-4 h-4" />
+                                    ) : (
+                                      <ChevronUp className="w-4 h-4" />
+                                    )}
+                                  </button>
+                                </div>
+                              </div>
+
+                              {/* Isi Kartu Siswa (4 Field Persis Gambar) */}
+                              {!isCollapsed && (
+                                <div className="p-4 sm:p-5 space-y-4">
+                                  {/* 1. Nama Lengkap */}
+                                  <div className="flex items-start gap-3">
+                                    <div className="mt-2 text-blue-600 shrink-0">
+                                      <User className="w-5 h-5" />
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                      <label className="block text-xs font-bold text-slate-800 mb-1.5">
+                                        Nama Lengkap <span className="text-rose-500">*</span>
+                                      </label>
+                                      <input
+                                        type="text"
+                                        value={student.nama}
+                                        onChange={e =>
+                                          handleUpdateStudent(student.id, { nama: e.target.value })
+                                        }
+                                        placeholder="Masukkan nama lengkap"
+                                        className="w-full px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl text-xs sm:text-sm font-medium text-slate-900 placeholder:text-slate-400 outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition"
+                                      />
+                                    </div>
+                                  </div>
+
+                                  {/* 2 & 3. Tempat Lahir + Tanggal Lahir */}
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                    {/* Tempat Lahir */}
+                                    <div className="flex items-start gap-3">
+                                      <div className="mt-2 text-blue-600 shrink-0">
+                                        <MapPin className="w-5 h-5" />
+                                      </div>
+                                      <div className="flex-1 min-w-0">
+                                        <label className="block text-xs font-bold text-slate-800 mb-1.5">
+                                          Tempat Lahir
+                                        </label>
+                                        <input
+                                          type="text"
+                                          value={student.tempatLahir}
+                                          onChange={e =>
+                                            handleUpdateStudent(student.id, { tempatLahir: e.target.value })
+                                          }
+                                          placeholder="Masukkan tempat lahir"
+                                          className="w-full px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl text-xs sm:text-sm font-medium text-slate-900 placeholder:text-slate-400 outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition"
+                                        />
+                                      </div>
+                                    </div>
+
+                                    {/* Tanggal Lahir */}
+                                    <div className="flex items-start gap-3">
+                                      <div className="mt-2 text-blue-600 shrink-0">
+                                        <Calendar className="w-5 h-5" />
+                                      </div>
+                                      <div className="flex-1 min-w-0">
+                                        <label className="block text-xs font-bold text-slate-800 mb-1.5">
+                                          Tanggal Lahir
+                                        </label>
+                                        <input
+                                          type="date"
+                                          value={student.tanggalLahir}
+                                          onChange={e =>
+                                            handleUpdateStudent(student.id, { tanggalLahir: e.target.value })
+                                          }
+                                          className="w-full px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl text-xs sm:text-sm font-medium text-slate-900 outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition"
+                                        />
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  {/* 4. Jenis Kelamin (Radio Laki-laki / Perempuan) */}
+                                  <div className="flex items-start gap-3 pt-1">
+                                    <div className="mt-0.5 text-blue-600 shrink-0">
+                                      <Users className="w-5 h-5" />
+                                    </div>
+                                    <div className="flex-1">
+                                      <span className="block text-xs font-bold text-slate-800 mb-2">
+                                        Jenis Kelamin
+                                      </span>
+                                      <div className="flex flex-wrap items-center gap-6">
+                                        {(['Laki-laki', 'Perempuan'] as const).map(genderOpt => {
+                                          const isChecked = student.jk === genderOpt;
+                                          return (
+                                            <label
+                                              key={genderOpt}
+                                              onClick={() => handleUpdateStudent(student.id, { jk: genderOpt })}
+                                              className="inline-flex items-center gap-2.5 cursor-pointer select-none py-1"
+                                            >
+                                              <span
+                                                className={`w-5 h-5 rounded-full border-2 flex items-center justify-center transition ${
+                                                  isChecked
+                                                    ? 'border-blue-600 bg-white'
+                                                    : 'border-slate-300 bg-white hover:border-blue-400'
+                                                }`}
+                                              >
+                                                {isChecked && (
+                                                  <span className="w-2.5 h-2.5 rounded-full bg-blue-600" />
+                                                )}
+                                              </span>
+                                              <span
+                                                className={`text-xs sm:text-sm ${
+                                                  isChecked
+                                                    ? 'font-bold text-slate-900'
+                                                    : 'font-medium text-slate-700'
+                                                }`}
+                                              >
+                                                {genderOpt}
+                                              </span>
+                                            </label>
+                                          );
+                                        })}
+                                      </div>
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {/* Tombol Dashed "+ Tambah Siswa Lainnya" */}
+                      <button
+                        type="button"
+                        onClick={handleAddStudent}
+                        className="w-full py-3.5 px-4 rounded-xl border-2 border-dashed border-blue-500/70 hover:border-blue-600 bg-white hover:bg-blue-50/70 text-blue-700 text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2.5 transition cursor-pointer"
+                      >
+                        <span className="w-6 h-6 rounded-full bg-blue-600 text-white flex items-center justify-center shrink-0">
+                          <Plus className="w-4 h-4" />
+                        </span>
+                        <span>Tambah Siswa Lainnya</span>
+                      </button>
+
+                      {/* Ringkasan Biaya & Tombol Utama "Daftar Sekarang" */}
+                      <div className="pt-2 space-y-3">
+                        <div className="bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                          <div className="text-slate-600">
+                            <span className="font-bold text-slate-800">Ringkasan Biaya Pendaftaran:</span>{' '}
+                            {currentFeeConfig.isFree ? (
+                              <span className="text-emerald-700 font-bold">Gratis (Bebas Biaya)</span>
+                            ) : (
+                              <span className="tabular-nums">
+                                {students.length} Siswa × {formatRupiah(unitFee)}
+                              </span>
+                            )}
+                          </div>
+                          <div className="font-black text-sm sm:text-base text-blue-700 font-mono tabular-nums">
+                            {currentFeeConfig.isFree ? 'Rp 0' : formatRupiah(totalFee)}
+                          </div>
+                        </div>
 
                         <button
                           type="button"
                           onClick={handleOpenSubmitAndPay}
                           disabled={isSubmitting}
-                          className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-75 text-white text-xs font-black flex items-center justify-center gap-2 transition cursor-pointer shadow-lg hover:shadow-xl"
+                          className="w-full py-3.5 px-6 rounded-xl bg-gradient-to-r from-blue-700 to-blue-600 hover:from-blue-800 hover:to-blue-700 disabled:opacity-75 text-white text-sm sm:text-base font-extrabold flex items-center justify-center gap-2.5 transition cursor-pointer shadow-lg hover:shadow-xl"
                         >
                           {isSubmitting ? (
                             <>
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                              <span>Menyimpan...</span>
+                              <Loader2 className="w-5 h-5 animate-spin" />
+                              <span>Memproses Pendaftaran...</span>
                             </>
                           ) : (
                             <>
-                              <CreditCard className="w-4 h-4 text-emerald-200" />
-                              <span>Lanjut Bayar</span>
+                              <Send className="w-5 h-5" />
+                              <span>Daftar Sekarang</span>
                             </>
                           )}
                         </button>
+
+                        {/* Opsi Tambahan Ringan */}
+                        <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={handleSaveForLater}
+                            disabled={isSubmitting}
+                            className="px-3.5 py-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-60 text-slate-700 text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+                          >
+                            {submittingAction === 'save_later' ? (
+                              <>
+                                <Loader2 className="w-3.5 h-3.5 animate-spin text-slate-500" />
+                                <span>Menyimpan...</span>
+                              </>
+                            ) : (
+                              <>
+                                <Save className="w-3.5 h-3.5 text-slate-500" />
+                                <span>Simpan Dulu (Bayar Nanti)</span>
+                              </>
+                            )}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => setFormDisplayMode('blanko')}
+                            className="px-3.5 py-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
+                          >
+                            <FileText className="w-3.5 h-3.5 text-blue-600" />
+                            <span>Lihat Blanko A4</span>
+                          </button>
+                        </div>
                       </div>
                     </div>
                   </div>
-                </div>
-              )}
+                );
+              })()}
 
               {/* COMPACT FORM 3: KEMAH BALOK 1 */}
               {currentTab === 'form_perkemahan_balok1' && (
@@ -1781,10 +1985,19 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
                           type="button"
                           onClick={handleSaveForLater}
                           disabled={isSubmitting}
-                          className="w-full sm:w-auto px-4 py-2.5 rounded-xl border border-slate-600 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center justify-center gap-2 transition cursor-pointer shadow-xs"
+                          className="w-full sm:w-auto px-4 py-2.5 rounded-xl border border-slate-600 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 text-xs font-bold flex items-center justify-center gap-2 transition cursor-pointer shadow-xs"
                         >
-                          <Save className="w-4 h-4 text-slate-400" />
-                          <span>Simpan Dulu (Bayar Nanti)</span>
+                          {submittingAction === 'save_later' ? (
+                            <>
+                              <Loader2 className="w-4 h-4 animate-spin text-slate-300" />
+                              <span>Menyimpan...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Save className="w-4 h-4 text-slate-400" />
+                              <span>Simpan Dulu (Bayar Nanti)</span>
+                            </>
+                          )}
                         </button>
 
                         <button
@@ -2004,10 +2217,19 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
                           type="button"
                           onClick={handleSaveForLater}
                           disabled={isSubmitting}
-                          className="w-full sm:w-auto px-4 py-2.5 rounded-xl border border-slate-600 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center justify-center gap-2 transition cursor-pointer shadow-xs"
+                          className="w-full sm:w-auto px-4 py-2.5 rounded-xl border border-slate-600 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 text-xs font-bold flex items-center justify-center gap-2 transition cursor-pointer shadow-xs"
                         >
-                          <Save className="w-4 h-4 text-slate-400" />
-                          <span>Simpan Dulu (Bayar Nanti)</span>
+                          {submittingAction === 'save_later' ? (
+                            <>
+                              <Loader2 className="w-4 h-4 animate-spin text-slate-300" />
+                              <span>Menyimpan...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Save className="w-4 h-4 text-slate-400" />
+                              <span>Simpan Dulu (Bayar Nanti)</span>
+                            </>
+                          )}
                         </button>
 
                         <button
@@ -2355,31 +2577,13 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
               </p>
             </div>
 
+            {/* Identitas Pangkalan */}
             <div className="space-y-3">
-              <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-900 border-b border-slate-300 pb-1">
-                A. Data Biodata Calon Anggota PKS
+              <h3 className="text-xs font-bold uppercase tracking-wider text-blue-900 border-b border-slate-300 pb-1">
+                A. Identitas Pangkalan Sekolah
               </h3>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-                <div>
-                  <label className="block text-slate-600 font-bold mb-1">Nama Lengkap Siswa</label>
-                  <input
-                    type="text"
-                    value={formCalonPks.nama}
-                    onChange={e => setFormCalonPks({ ...formCalonPks, nama: e.target.value })}
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-semibold outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="block text-slate-600 font-bold mb-1">NISN</label>
-                  <input
-                    type="text"
-                    value={formCalonPks.nisn}
-                    onChange={e => setFormCalonPks({ ...formCalonPks, nisn: e.target.value })}
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono outline-none"
-                  />
-                </div>
-                <div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                <div className="sm:col-span-2">
                   <label className="block text-slate-600 font-bold mb-1">Pangkalan Sekolah</label>
                   <input
                     type="text"
@@ -2388,98 +2592,59 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
                     className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-semibold outline-none"
                   />
                 </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <div>
-                    <label className="block text-slate-600 font-bold mb-1">Tingkat</label>
-                    <select
-                      value={formCalonPks.jenjang}
-                      onChange={e => setFormCalonPks({ ...formCalonPks, jenjang: e.target.value as SchoolLevel })}
-                      className="w-full px-2 py-1.5 border border-slate-300 rounded-lg text-xs bg-white font-bold"
-                    >
-                      <option value="SLTP">SLTP</option>
-                      <option value="SLTA">SLTA</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-slate-600 font-bold mb-1">Kelas</label>
-                    <input
-                      type="text"
-                      value={formCalonPks.kelas}
-                      onChange={e => setFormCalonPks({ ...formCalonPks, kelas: e.target.value })}
-                      className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs outline-none"
-                    />
-                  </div>
-                </div>
-
                 <div>
-                  <label className="block text-slate-600 font-bold mb-1">Tempat, Tanggal Lahir</label>
-                  <input
-                    type="text"
-                    value={formCalonPks.ttl}
-                    onChange={e => setFormCalonPks({ ...formCalonPks, ttl: e.target.value })}
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs outline-none"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-slate-600 font-bold mb-1">Divisi Minat PKS</label>
+                  <label className="block text-slate-600 font-bold mb-1">Tingkat / Jenjang</label>
                   <select
-                    value={formCalonPks.divisiMinat}
-                    onChange={e => setFormCalonPks({ ...formCalonPks, divisiMinat: e.target.value })}
+                    value={formCalonPks.jenjang}
+                    onChange={e => setFormCalonPks({ ...formCalonPks, jenjang: e.target.value as SchoolLevel })}
                     className="w-full px-2 py-1.5 border border-slate-300 rounded-lg text-xs bg-white font-bold"
                   >
-                    <option value="Gatur Lantas & Keselamatan Jalan">Gatur Lantas & Keselamatan Jalan</option>
-                    <option value="PBB & Tata Upacara Bendera">PBB & Tata Upacara Bendera</option>
-                    <option value="Keamanan & Ketertiban Lingkungan Sekolah">Keamanan & Ketertiban Lingkungan Sekolah</option>
-                    <option value="Pertolongan Pertama (P3K) & SAR">Pertolongan Pertama (P3K) & SAR</option>
+                    <option value="SLTP">SLTP (SMP/MTs)</option>
+                    <option value="SLTA">SLTA (SMA/SMK/MA)</option>
                   </select>
-                </div>
-
-                <div className="sm:col-span-2">
-                  <label className="block text-slate-600 font-bold mb-1">Alamat Rumah Lengkap</label>
-                  <input
-                    type="text"
-                    value={formCalonPks.alamat}
-                    onChange={e => setFormCalonPks({ ...formCalonPks, alamat: e.target.value })}
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs outline-none"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-slate-600 font-bold mb-1">No. WhatsApp Siswa</label>
-                  <input
-                    type="text"
-                    value={formCalonPks.noHp}
-                    onChange={e => setFormCalonPks({ ...formCalonPks, noHp: e.target.value })}
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono outline-none"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-slate-600 font-bold mb-1">Nama Guru Pembina PKS</label>
-                  <input
-                    type="text"
-                    value={formCalonPks.namaPembina}
-                    onChange={e => setFormCalonPks({ ...formCalonPks, namaPembina: e.target.value })}
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs outline-none"
-                  />
                 </div>
               </div>
             </div>
 
-            {/* Surat Pernyataan / Izin Ortu */}
-            <div className="bg-slate-50 border border-slate-200 p-4 rounded-xl text-xs space-y-2">
-              <label className="flex items-start gap-2.5 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={formCalonPks.izinOrtu}
-                  onChange={e => setFormCalonPks({ ...formCalonPks, izinOrtu: e.target.checked })}
-                  className="mt-0.5 w-4 h-4 text-indigo-600 rounded border-slate-300"
-                />
-                <span className="text-slate-700 leading-relaxed">
-                  <strong>Pernyataan Kesiapan:</strong> Dengan ini saya menyatakan bersedia mengikuti seluruh tahapan latihan dasar disiplin, mentaati Tri Siap dan Panca PKS, serta telah mendapatkan izin tertulis dari orang tua/wali untuk bergabung aktif dalam Korps PKS.
-                </span>
-              </label>
+            {/* Tabel Daftar Siswa Calon Anggota PKS */}
+            <div className="space-y-3">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-blue-900 border-b border-slate-300 pb-1">
+                B. Daftar Siswa Calon Anggota PKS ({(formCalonPks.students || []).length} Siswa)
+              </h3>
+              <div className="border border-slate-300 rounded-lg overflow-hidden">
+                <table className="w-full text-left text-xs border-collapse">
+                  <thead className="bg-slate-100 text-slate-800 font-bold border-b border-slate-300">
+                    <tr>
+                      <th className="p-2.5 border-r border-slate-300 w-10 text-center">No</th>
+                      <th className="p-2.5 border-r border-slate-300">Nama Lengkap Siswa</th>
+                      <th className="p-2.5 border-r border-slate-300">Tempat Lahir</th>
+                      <th className="p-2.5 border-r border-slate-300 w-32">Tanggal Lahir</th>
+                      <th className="p-2.5 w-28">Jenis Kelamin</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-200">
+                    {(formCalonPks.students || []).map((st, idx) => (
+                      <tr key={st.id}>
+                        <td className="p-2.5 border-r border-slate-300 text-center font-bold">{idx + 1}</td>
+                        <td className="p-2.5 border-r border-slate-300 font-semibold text-slate-900">
+                          {st.nama || '................................................'}
+                        </td>
+                        <td className="p-2.5 border-r border-slate-300">{st.tempatLahir || '-'}</td>
+                        <td className="p-2.5 border-r border-slate-300 font-mono">
+                          {st.tanggalLahir
+                            ? new Date(st.tanggalLahir).toLocaleDateString('id-ID', {
+                                day: '2-digit',
+                                month: 'short',
+                                year: 'numeric'
+                              })
+                            : '-'}
+                        </td>
+                        <td className="p-2.5">{st.jk || '-'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
 
             {/* Signature Block */}
@@ -2490,13 +2655,13 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
 
               <div className="grid grid-cols-3 gap-4">
                 <div>
-                  <p className="font-semibold text-slate-600">Pemohon,</p>
+                  <p className="font-semibold text-slate-600">Pemohon / Perwakilan,</p>
                   <p className="font-bold text-slate-800">{blankoConfig?.forms?.calon_pks?.ttd1Label || 'Calon Anggota PKS'}</p>
                   <div className="h-16 flex items-center justify-center text-[10px] text-slate-400 italic">
                     (Tanda Tangan)
                   </div>
                   <p className="font-bold underline text-slate-900">
-                    {formCalonPks.nama || '...........................................'}
+                    {formCalonPks.students?.[0]?.nama || '...........................................'}
                   </p>
                 </div>
 
@@ -2507,7 +2672,7 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
                     (Stempel & TTD)
                   </div>
                   <p className="font-bold underline text-slate-900">
-                    {formCalonPks.namaPembina || '...........................................'}
+                    ...........................................
                   </p>
                 </div>
 
@@ -2868,8 +3033,8 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
       <div className="no-print max-w-4xl mx-auto bg-slate-900 text-white p-4 rounded-2xl flex flex-col sm:flex-row items-center justify-between gap-3 shadow-lg">
         <div>
           <p className="text-xs text-slate-300 font-semibold">Formulir telah selesai diisi?</p>
-          <p className="text-sm font-black text-white">
-            Kirim ke Panitia & Bayar Registrasi ({currentFeeConfig.isFree ? 'Gratis' : formatRupiah(currentFeeConfig.fee)})
+          <p className="text-sm font-black text-white tabular-nums">
+            Kirim ke Panitia & Bayar Registrasi ({currentFeeConfig.isFree ? 'Gratis' : formatRupiah(activeTotalFee)})
           </p>
         </div>
         <div className="flex flex-col sm:flex-row items-center gap-2 w-full sm:w-auto">
@@ -2877,10 +3042,19 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
             type="button"
             onClick={handleSaveForLater}
             disabled={isSubmitting}
-            className="w-full sm:w-auto px-4 py-2.5 rounded-xl border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
+            className="w-full sm:w-auto px-4 py-2.5 rounded-xl border border-slate-700 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
           >
-            <Save className="w-4 h-4 text-slate-400" />
-            <span>Simpan Dulu (Bayar Nanti)</span>
+            {submittingAction === 'save_later' ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin text-slate-300" />
+                <span>Menyimpan...</span>
+              </>
+            ) : (
+              <>
+                <Save className="w-4 h-4 text-slate-400" />
+                <span>Simpan Dulu (Bayar Nanti)</span>
+              </>
+            )}
           </button>
 
           <button
@@ -3138,8 +3312,12 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
           </div>
           <button
             type="button"
-            onClick={() => setPaymentModalOpen(false)}
-            className="p-1 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition cursor-pointer"
+            disabled={isSubmitting}
+            onClick={() => {
+              setNetworkError(null);
+              setPaymentModalOpen(false);
+            }}
+            className="p-1 rounded-lg hover:bg-slate-800 disabled:opacity-50 text-slate-400 hover:text-white transition cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -3147,11 +3325,18 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
 
         {/* Modal Body */}
         <div className="p-5 overflow-y-auto space-y-4 text-xs text-slate-700">
+          <NetworkErrorBanner error={networkError} onDismiss={() => setNetworkError(null)} />
           {/* Bill Summary Banner */}
           <div className="bg-blue-50 border border-blue-200 p-4 rounded-xl flex items-center justify-between">
             <div>
               <p className="text-[11px] font-bold text-blue-900 uppercase tracking-wider">Total Tagihan Registrasi</p>
               <p className="text-xs text-slate-600 mt-0.5">Asal: {pendingSubmissionPayload.schoolName}</p>
+              {pendingSubmissionPayload.formType === 'calon_pks' &&
+                Number(pendingSubmissionPayload.formData?.studentCount || 1) > 1 && (
+                  <p className="text-[11px] font-bold text-blue-700 mt-0.5">
+                    {pendingSubmissionPayload.formData?.studentCount} Siswa × {formatRupiah(pendingSubmissionPayload.formData?.unitFee || 0)}
+                  </p>
+                )}
             </div>
             <div className="text-right">
               <span className="text-xl sm:text-2xl font-black text-blue-900 font-mono">
@@ -3465,8 +3650,12 @@ export const RegistrationFormsView: React.FC<RegistrationFormsViewProps> = ({
         <div className="bg-slate-100 px-5 py-3.5 flex items-center justify-between gap-3 border-t border-slate-200 shrink-0">
           <button
             type="button"
-            onClick={() => setPaymentModalOpen(false)}
-            className="px-4 py-2 border border-slate-300 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-200 transition cursor-pointer"
+            disabled={isSubmitting}
+            onClick={() => {
+              setNetworkError(null);
+              setPaymentModalOpen(false);
+            }}
+            className="px-4 py-2 border border-slate-300 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-200 disabled:opacity-50 transition cursor-pointer"
           >
             Batal
           </button>

@@ -83,7 +83,7 @@
         "role": {
           "type": "string",
           "description": "Peran akun dalam sistem",
-          "enum": ["superadmin", "admin", "juri", "sekolah", "user"]
+          "enum": ["superadmin", "admin", "juri", "sekolah", "pembina_polres", "user"]
         },
         "schoolName": {
           "type": "string",
@@ -269,7 +269,7 @@
       "schema": {
         "$ref": "#/entities/AppLogo"
       },
-      "description": "Pengaturan logo aplikasi dan informasi umum"
+      "description": "Pengaturan aplikasi global (global_logo, app_status, payment_config, dan blanko_config)"
     },
     "/registrations/{registrationId}": {
       "schema": {

@@ -69,15 +69,98 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [detailModalItem, setDetailModalItem] = useState<ExtractedMemberItem | null>(null);
 
+  // Helper to format YYYY-MM-DD date cleanly
+  const formatBirthDate = (iso?: string) => {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    return d.toLocaleDateString('id-ID', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric'
+    });
+  };
+
+  const isSekolahViewer = currentUser?.role === 'sekolah';
+  const ownUsernameKey = (currentUser?.username || '').toLowerCase().trim();
+  const ownSchoolKey = (currentUser?.schoolName || currentUser?.name || '').toLowerCase().trim();
+
+  // Strictly scope submissions for Sekolah accounts so they never see other schools' members
+  const visibleSubmissions = useMemo(() => {
+    if (!isSekolahViewer) return submissionsList;
+    return submissionsList.filter(sub => {
+      const subUser = (sub.schoolUsername || '').toLowerCase().trim();
+      const subSchool = (sub.schoolName || '').toLowerCase().trim();
+      const matchUser = Boolean(ownUsernameKey && subUser && subUser === ownUsernameKey);
+      const matchSchool = Boolean(ownSchoolKey && subSchool && subSchool === ownSchoolKey);
+      return matchUser || matchSchool;
+    });
+  }, [submissionsList, isSekolahViewer, ownUsernameKey, ownSchoolKey]);
+
   // Flatten and extract individual member data from registrations
   const allMembers: ExtractedMemberItem[] = useMemo(() => {
-    return submissionsList.map(sub => {
+    return visibleSubmissions.flatMap((sub): ExtractedMemberItem[] => {
       let categoryLabel = 'Pendaftaran PKS';
       let studentName = sub.applicantName || 'Peserta';
       let identifier = '-';
       let classGrade = sub.formData?.kelas || '-';
       let gender = sub.formData?.jk || '-';
-      let pembinaName = sub.formData?.namaPembina || '-';
+      const pembinaName = sub.formData?.namaPembina || '-';
+
+      let verificationStatus = 'Menunggu Verifikasi';
+      if (sub.stage2Committee?.status === 'approved') {
+        verificationStatus = 'Terverifikasi Panitia';
+      } else if (sub.stage1Finance?.status === 'approved') {
+        verificationStatus = 'Lolos Keuangan';
+      } else if (sub.paymentStatus === 'unpaid') {
+        verificationStatus = 'Belum Bayar';
+      }
+
+      const submissionDate = sub.createdAt
+        ? new Date(sub.createdAt).toLocaleDateString('id-ID', {
+            day: 'numeric',
+            month: 'short',
+            year: 'numeric'
+          })
+        : '-';
+
+      // Handle multi-student Calon Anggota PKS batch submissions
+      if (sub.formType === 'calon_pks' && Array.isArray(sub.formData?.students) && sub.formData.students.length > 0) {
+        const batchTotal = sub.formData.students.length;
+        return sub.formData.students.map((st: any, idx: number) => {
+          const tempat = (st?.tempatLahir || '').trim();
+          const tglFormatted = formatBirthDate(st?.tanggalLahir);
+          const ttlText = [tempat, tglFormatted].filter(Boolean).join(', ');
+
+          return {
+            id: `${sub.id}__${st?.id || idx}`,
+            submissionId: sub.id,
+            categoryKey: 'calon_pks' as const,
+            categoryLabel: 'Calon Anggota PKS',
+            studentName: (st?.nama || '').trim() || `Calon Siswa #${idx + 1}`,
+            schoolName: sub.schoolName,
+            schoolLevel: sub.schoolLevel || 'SLTP',
+            identifier: ttlText ? `TTL: ${ttlText}` : `Calon PKS #${idx + 1}`,
+            classGrade: '-',
+            gender: st?.jk || '-',
+            pembinaName,
+            contactWa: sub.contactWa || sub.formData?.noHp || sub.formData?.noHpPembina || '-',
+            submissionDate,
+            paymentStatus: sub.paymentStatus,
+            verificationStatus,
+            fullData: {
+              ...sub.formData,
+              nama: st?.nama || '',
+              tempatLahir: tempat,
+              tanggalLahir: st?.tanggalLahir || '',
+              ttl: ttlText || '-',
+              jk: st?.jk || '-',
+              batchIndex: idx + 1,
+              batchTotal
+            }
+          };
+        });
+      }
 
       if (sub.formType === 'polisi_pelajar') {
         categoryLabel = 'Polisi Pelajar (Poljar)';
@@ -104,39 +187,28 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
           : 'Kualifikasi Balok 2';
       }
 
-      let verificationStatus = 'Menunggu Verifikasi';
-      if (sub.stage2Committee?.status === 'approved') {
-        verificationStatus = 'Terverifikasi Panitia';
-      } else if (sub.stage1Finance?.status === 'approved') {
-        verificationStatus = 'Lolos Keuangan';
-      } else if (sub.paymentStatus === 'unpaid') {
-        verificationStatus = 'Belum Bayar';
-      }
-
-      return {
-        id: sub.id,
-        submissionId: sub.id,
-        categoryKey: sub.formType,
-        categoryLabel,
-        studentName,
-        schoolName: sub.schoolName,
-        schoolLevel: sub.schoolLevel || 'SLTP',
-        identifier,
-        classGrade,
-        gender,
-        pembinaName,
-        contactWa: sub.contactWa || sub.formData?.noHp || sub.formData?.noHpPembina || '-',
-        submissionDate: sub.createdAt ? new Date(sub.createdAt).toLocaleDateString('id-ID', {
-          day: 'numeric',
-          month: 'short',
-          year: 'numeric'
-        }) : '-',
-        paymentStatus: sub.paymentStatus,
-        verificationStatus,
-        fullData: sub.formData || {}
-      };
+      return [
+        {
+          id: sub.id,
+          submissionId: sub.id,
+          categoryKey: sub.formType,
+          categoryLabel,
+          studentName,
+          schoolName: sub.schoolName,
+          schoolLevel: sub.schoolLevel || 'SLTP',
+          identifier,
+          classGrade,
+          gender,
+          pembinaName,
+          contactWa: sub.contactWa || sub.formData?.noHp || sub.formData?.noHpPembina || '-',
+          submissionDate,
+          paymentStatus: sub.paymentStatus,
+          verificationStatus,
+          fullData: sub.formData || {}
+        }
+      ];
     });
-  }, [submissionsList]);
+  }, [visibleSubmissions]);
 
   // Unique schools list for filtering
   const uniqueSchools = useMemo(() => {
@@ -260,7 +332,9 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
               Daftar Nama-Nama Anggota PKS
             </h1>
             <p className="text-xs sm:text-sm text-slate-300 max-w-2xl mt-0.5">
-              Direktori lengkap seluruh nama siswa dan anggota Patroli Keamanan Sekolah yang didaftarkan oleh pihak sekolah ke masing-masing kategori kegiatan.
+              {isSekolahViewer
+                ? `Daftar anggota Patroli Keamanan Sekolah yang didaftarkan oleh ${currentUser?.schoolName || currentUser?.name || 'sekolah Anda'}.`
+                : 'Direktori lengkap seluruh nama siswa dan anggota Patroli Keamanan Sekolah yang didaftarkan oleh pihak sekolah ke masing-masing kategori kegiatan.'}
             </p>
           </div>
         </div>
@@ -481,20 +555,29 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
             )}
           </div>
 
-          <div className="w-full sm:w-64 shrink-0">
-            <select
-              value={selectedSchool}
-              onChange={e => setSelectedSchool(e.target.value)}
-              className="w-full py-2 px-3 border border-slate-200 rounded-xl text-xs sm:text-sm bg-white font-semibold focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
-            >
-              <option value="all">Semua Pangkalan Sekolah ({uniqueSchools.length})</option>
-              {uniqueSchools.map(sch => (
-                <option key={sch} value={sch}>
-                  {sch}
-                </option>
-              ))}
-            </select>
-          </div>
+          {!isSekolahViewer ? (
+            <div className="w-full sm:w-64 shrink-0">
+              <select
+                value={selectedSchool}
+                onChange={e => setSelectedSchool(e.target.value)}
+                className="w-full py-2 px-3 border border-slate-200 rounded-xl text-xs sm:text-sm bg-white font-semibold focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
+              >
+                <option value="all">Semua Pangkalan Sekolah ({uniqueSchools.length})</option>
+                {uniqueSchools.map(sch => (
+                  <option key={sch} value={sch}>
+                    {sch}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : (
+            <div className="w-full sm:w-auto shrink-0 px-3 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold flex items-center gap-1.5">
+              <Building2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+              <span className="truncate max-w-[220px]">
+                {currentUser?.schoolName || currentUser?.name || 'Sekolah Anda'}
+              </span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -782,6 +865,14 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
                     Informasi Tambahan dari Formulir:
                   </span>
                   <div className="bg-white border border-slate-200 rounded-2xl p-3.5 space-y-1.5 text-slate-600">
+                    {detailModalItem.fullData.batchTotal > 1 && (
+                      <div className="flex justify-between py-1 border-b border-slate-100">
+                        <span className="text-slate-400">Urutan Pendaftaran Batch:</span>
+                        <span className="font-semibold text-blue-700">
+                          Siswa ke-{detailModalItem.fullData.batchIndex} dari {detailModalItem.fullData.batchTotal} siswa
+                        </span>
+                      </div>
+                    )}
                     {detailModalItem.fullData.ttl && (
                       <div className="flex justify-between py-1 border-b border-slate-100">
                         <span className="text-slate-400">Tempat, Tanggal Lahir:</span>

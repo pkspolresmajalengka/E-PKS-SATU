@@ -9,21 +9,43 @@ import {
   setDoc,
   deleteDoc,
   collection,
-  onSnapshot
+  getDocs,
+  query,
+  limit,
+  onSnapshot,
+  disableNetwork,
+  enableNetwork,
+  persistentLocalCache,
+  persistentMultipleTabManager
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
+import {
+  enqueueOfflineMutation,
+  getOfflineQueue,
+  removeOfflineMutation,
+  OfflineMutationType
+} from './offlineSyncQueue';
 
 // Initialize Firebase App
 const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
 
-// CRITICAL: Initialize Firestore with ignoreUndefinedProperties to prevent crashes on optional/undefined fields
+// CRITICAL: Initialize Firestore with ignoreUndefinedProperties & IndexedDB persistent local cache for offline support
 let dbInstance;
 try {
   dbInstance = initializeFirestore(app, {
-    ignoreUndefinedProperties: true
+    ignoreUndefinedProperties: true,
+    localCache: persistentLocalCache({
+      tabManager: persistentMultipleTabManager()
+    })
   }, firebaseConfig.firestoreDatabaseId);
 } catch {
-  dbInstance = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  try {
+    dbInstance = initializeFirestore(app, {
+      ignoreUndefinedProperties: true
+    }, firebaseConfig.firestoreDatabaseId);
+  } catch {
+    dbInstance = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  }
 }
 
 export const db = dbInstance;
@@ -126,7 +148,7 @@ export async function testConnection(): Promise<boolean> {
 
 // 1. PARTICIPANTS (Peserta Lomba)
 export function subscribeToParticipants(
-  onUpdate: (participants: any[]) => void,
+  onUpdate: (participants: any[], fromCache?: boolean) => void,
   onError?: (err: any) => void
 ) {
   const path = 'participants';
@@ -137,7 +159,7 @@ export function subscribeToParticipants(
       snapshot.forEach(docSnap => {
         items.push(docSnap.data());
       });
-      onUpdate(items);
+      onUpdate(items, snapshot.metadata.fromCache);
     },
     error => {
       handleFirestoreError(error, OperationType.LIST, path);
@@ -146,38 +168,311 @@ export function subscribeToParticipants(
   );
 }
 
-export async function saveParticipantToCloud(participant: any): Promise<{ success: boolean; error?: string }> {
+export interface CloudWriteResult {
+  success: boolean;
+  queuedOffline?: boolean;
+  error?: string;
+  isNetworkError?: boolean;
+  isQuotaError?: boolean;
+}
+
+export interface CloudWriteOptions {
+  bypassQuotaGuard?: boolean;
+  skipOfflineQueue?: boolean;
+}
+
+const CLOUD_WRITE_TIMEOUT_MS = 10000;
+const QUOTA_EXCEEDED_USER_MSG =
+  'Kuota tulis harian Cloud Firestore telah tercapai. Kuota akan direset otomatis keesokan harinya. Perubahan tetap disimpan secara lokal di perangkat ini.';
+
+let writeQuotaExceeded = false;
+const quotaListeners = new Set<(exceeded: boolean) => void>();
+const pendingQuotaAbortRejectors = new Set<(err: Error) => void>();
+let quotaConsoleObserverInstalled = false;
+
+export function isQuotaExceededError(error: unknown): boolean {
+  const raw = error instanceof Error ? error.message : String(error || '');
+  const lower = raw.toLowerCase();
+  return (
+    lower.includes('quota') ||
+    lower.includes('free daily write') ||
+    lower.includes('free daily read') ||
+    lower.includes('write units per project') ||
+    lower.includes('read units per project')
+  );
+}
+
+export function isCloudWriteQuotaExceeded(): boolean {
+  return writeQuotaExceeded;
+}
+
+export function subscribeToCloudQuota(listener: (exceeded: boolean) => void): () => void {
+  quotaListeners.add(listener);
+  listener(writeQuotaExceeded);
+  return () => {
+    quotaListeners.delete(listener);
+  };
+}
+
+export function markCloudWriteQuotaExceeded(): void {
+  if (!writeQuotaExceeded) {
+    writeQuotaExceeded = true;
+    quotaListeners.forEach(cb => {
+      try {
+        cb(true);
+      } catch {
+        // ignore listener errors
+      }
+    });
+  }
+
+  // Abort any in-flight mutation waiting on Firestore's retry stream
+  if (pendingQuotaAbortRejectors.size > 0) {
+    const quotaErr = new Error('Quota limit exceeded (Free daily write units per project).');
+    const rejectors = Array.from(pendingQuotaAbortRejectors);
+    pendingQuotaAbortRejectors.clear();
+    rejectors.forEach(reject => {
+      try {
+        reject(quotaErr);
+      } catch {
+        // ignore
+      }
+    });
+  }
+
+  // Pause Firestore background retry stream so SDK stops "Using maximum backoff delay" loops
+  void disableNetwork(db).catch(() => undefined);
+}
+
+export async function resetCloudWriteQuotaGuard(): Promise<void> {
+  writeQuotaExceeded = false;
+  quotaListeners.forEach(cb => {
+    try {
+      cb(false);
+    } catch {
+      // ignore
+    }
+  });
+  try {
+    await enableNetwork(db);
+  } catch {
+    // ignore
+  }
+}
+
+function installFirestoreQuotaObserver(): void {
+  if (quotaConsoleObserverInstalled || typeof console === 'undefined') return;
+  quotaConsoleObserverInstalled = true;
+
+  const inspectArgs = (args: unknown[]) => {
+    try {
+      if (!args || args.length === 0) return;
+      const joined = args.map(a => (typeof a === 'string' ? a : String(a || ''))).join(' ');
+      const lower = joined.toLowerCase();
+      if (
+        lower.includes('@firebase/firestore') &&
+        (lower.includes('quota limit exceeded') ||
+          lower.includes('free daily write units') ||
+          lower.includes('free daily read units'))
+      ) {
+        markCloudWriteQuotaExceeded();
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const origError = console.error.bind(console);
+  console.error = (...args: unknown[]) => {
+    inspectArgs(args);
+    origError(...args);
+  };
+
+  const origWarn = console.warn.bind(console);
+  console.warn = (...args: unknown[]) => {
+    inspectArgs(args);
+    origWarn(...args);
+  };
+}
+
+installFirestoreQuotaObserver();
+
+export function classifyCloudError(
+  error: unknown
+): { message: string; isNetworkError: boolean; isQuotaError: boolean } {
+  const raw = error instanceof Error ? error.message : String(error || '');
+  const lower = raw.toLowerCase();
+
+  // Check quota errors BEFORE generic resource-exhausted so daily write quota is never mislabeled as 1 MB payload size
+  if (isQuotaExceededError(error)) {
+    return {
+      message: QUOTA_EXCEEDED_USER_MSG,
+      isNetworkError: false,
+      isQuotaError: true
+    };
+  }
+
+  if (
+    (typeof navigator !== 'undefined' && !navigator.onLine) ||
+    lower.includes('offline') ||
+    lower.includes('network') ||
+    lower.includes('failed to fetch') ||
+    lower.includes('unavailable') ||
+    lower.includes('timeout') ||
+    lower.includes('deadline-exceeded')
+  ) {
+    return {
+      message: 'Gangguan jaringan atau koneksi internet terputus. Data belum terkirim ke server Cloud. Periksa koneksi Anda lalu klik Coba Lagi.',
+      isNetworkError: true,
+      isQuotaError: false
+    };
+  }
+
+  if (lower.includes('permission-denied') || lower.includes('insufficient permissions')) {
+    return {
+      message: 'Akses penyimpanan Cloud ditolak oleh aturan keamanan server.',
+      isNetworkError: false,
+      isQuotaError: false
+    };
+  }
+
+  if (
+    lower.includes('resource-exhausted') ||
+    lower.includes('longer than 1048487') ||
+    lower.includes('maximum allowed size') ||
+    lower.includes('payload too large')
+  ) {
+    return {
+      message: 'Ukuran berkas atau foto terlalu besar untuk disimpan ke Cloud (maks. 1 MB). Silakan pilih gambar yang lebih kecil.',
+      isNetworkError: false,
+      isQuotaError: false
+    };
+  }
+
+  return {
+    message: raw || 'Terjadi kesalahan saat menyimpan data ke server Cloud.',
+    isNetworkError: false,
+    isQuotaError: false
+  };
+}
+
+async function executeCloudMutation(
+  operation: () => Promise<void>,
+  operationType: OperationType,
+  path: string,
+  options?: CloudWriteOptions,
+  offlineSpec?: { type: OfflineMutationType; entityId: string; payload?: any }
+): Promise<CloudWriteResult> {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    if (offlineSpec && !options?.skipOfflineQueue) {
+      enqueueOfflineMutation(offlineSpec.type, offlineSpec.entityId, offlineSpec.payload);
+      return {
+        success: false,
+        queuedOffline: true,
+        isNetworkError: true,
+        isQuotaError: false,
+        error: 'Perangkat sedang offline. Perubahan disimpan lokal & masuk antrean sinkronisasi otomatis.'
+      };
+    }
+    return {
+      success: false,
+      isNetworkError: true,
+      isQuotaError: false,
+      error: 'Perangkat sedang offline (tidak ada koneksi internet). Data belum tersimpan ke Cloud.'
+    };
+  }
+
+  if (writeQuotaExceeded && !options?.bypassQuotaGuard) {
+    return {
+      success: false,
+      isNetworkError: false,
+      isQuotaError: true,
+      error: QUOTA_EXCEEDED_USER_MSG
+    };
+  }
+
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let abortRejector: ((err: Error) => void) | undefined;
+
+  try {
+    await Promise.race([
+      operation(),
+      new Promise<never>((_, reject) => {
+        abortRejector = reject;
+        pendingQuotaAbortRejectors.add(reject);
+        timeoutId = setTimeout(() => {
+          reject(new Error('network timeout: Server Cloud tidak merespons dalam batas waktu.'));
+        }, CLOUD_WRITE_TIMEOUT_MS);
+      })
+    ]);
+    return { success: true };
+  } catch (error) {
+    if (isQuotaExceededError(error)) {
+      markCloudWriteQuotaExceeded();
+    } else {
+      handleFirestoreError(error, operationType, path);
+    }
+    const classified = classifyCloudError(error);
+    if (classified.isNetworkError && offlineSpec && !options?.skipOfflineQueue) {
+      enqueueOfflineMutation(offlineSpec.type, offlineSpec.entityId, offlineSpec.payload);
+      return {
+        success: false,
+        queuedOffline: true,
+        error: 'Koneksi ke Cloud terputus. Perubahan disimpan lokal & akan otomatis tersinkron saat online.',
+        isNetworkError: true,
+        isQuotaError: false
+      };
+    }
+    return {
+      success: false,
+      error: classified.message,
+      isNetworkError: classified.isNetworkError,
+      isQuotaError: classified.isQuotaError
+    };
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+    if (abortRejector) pendingQuotaAbortRejectors.delete(abortRejector);
+  }
+}
+
+export async function saveParticipantToCloud(
+  participant: any,
+  options?: CloudWriteOptions
+): Promise<CloudWriteResult> {
   if (!participant || !participant.id) {
     return { success: false, error: 'ID peserta tidak valid' };
   }
   const path = `participants/${participant.id}`;
-  try {
-    const cleanDoc = sanitizeForFirestore({
-      ...participant,
-      updatedAt: new Date().toISOString()
-    });
-    await setDoc(doc(db, 'participants', participant.id), cleanDoc);
-    return { success: true };
-  } catch (error) {
-    const errInfo = handleFirestoreError(error, OperationType.WRITE, path);
-    return { success: false, error: errInfo.error };
-  }
+  const cleanDoc = sanitizeForFirestore({
+    ...participant,
+    updatedAt: new Date().toISOString()
+  });
+  return executeCloudMutation(
+    () => setDoc(doc(db, 'participants', participant.id), cleanDoc),
+    OperationType.WRITE,
+    path,
+    options,
+    { type: 'participant_save', entityId: participant.id, payload: cleanDoc }
+  );
 }
 
-export async function deleteParticipantFromCloud(participantId: string): Promise<{ success: boolean; error?: string }> {
+export async function deleteParticipantFromCloud(
+  participantId: string,
+  options?: CloudWriteOptions
+): Promise<CloudWriteResult> {
   const path = `participants/${participantId}`;
-  try {
-    await deleteDoc(doc(db, 'participants', participantId));
-    return { success: true };
-  } catch (error) {
-    const errInfo = handleFirestoreError(error, OperationType.DELETE, path);
-    return { success: false, error: errInfo.error };
-  }
+  return executeCloudMutation(
+    () => deleteDoc(doc(db, 'participants', participantId)),
+    OperationType.DELETE,
+    path,
+    options,
+    { type: 'participant_delete', entityId: participantId }
+  );
 }
 
 // 2. USERS (Akun Admin, Juri, Sekolah)
 export function subscribeToUsers(
-  onUpdate: (users: any[]) => void,
+  onUpdate: (users: any[], fromCache?: boolean) => void,
   onError?: (err: any) => void
 ) {
   const path = 'users';
@@ -188,7 +483,7 @@ export function subscribeToUsers(
       snapshot.forEach(docSnap => {
         items.push(docSnap.data());
       });
-      onUpdate(items);
+      onUpdate(items, snapshot.metadata.fromCache);
     },
     error => {
       handleFirestoreError(error, OperationType.LIST, path);
@@ -197,41 +492,47 @@ export function subscribeToUsers(
   );
 }
 
-export async function saveUserToCloud(user: any): Promise<{ success: boolean; error?: string }> {
+export async function saveUserToCloud(
+  user: any,
+  options?: CloudWriteOptions
+): Promise<CloudWriteResult> {
   if (!user || !user.username) {
     return { success: false, error: 'Username tidak valid' };
   }
   const cleanUsername = String(user.username).trim().toLowerCase().replace(/\s+/g, '');
   const path = `users/${cleanUsername}`;
-  try {
-    const cleanDoc = sanitizeForFirestore({
-      ...user,
-      username: cleanUsername,
-      updatedAt: new Date().toISOString()
-    });
-    await setDoc(doc(db, 'users', cleanUsername), cleanDoc);
-    return { success: true };
-  } catch (error) {
-    const errInfo = handleFirestoreError(error, OperationType.WRITE, path);
-    return { success: false, error: errInfo.error };
-  }
+  const cleanDoc = sanitizeForFirestore({
+    ...user,
+    username: cleanUsername,
+    updatedAt: new Date().toISOString()
+  });
+  return executeCloudMutation(
+    () => setDoc(doc(db, 'users', cleanUsername), cleanDoc),
+    OperationType.WRITE,
+    path,
+    options,
+    { type: 'user_save', entityId: cleanUsername, payload: cleanDoc }
+  );
 }
 
-export async function deleteUserFromCloud(username: string): Promise<{ success: boolean; error?: string }> {
+export async function deleteUserFromCloud(
+  username: string,
+  options?: CloudWriteOptions
+): Promise<CloudWriteResult> {
   const cleanUsername = String(username).trim().toLowerCase().replace(/\s+/g, '');
   const path = `users/${cleanUsername}`;
-  try {
-    await deleteDoc(doc(db, 'users', cleanUsername));
-    return { success: true };
-  } catch (error) {
-    const errInfo = handleFirestoreError(error, OperationType.DELETE, path);
-    return { success: false, error: errInfo.error };
-  }
+  return executeCloudMutation(
+    () => deleteDoc(doc(db, 'users', cleanUsername)),
+    OperationType.DELETE,
+    path,
+    options,
+    { type: 'user_delete', entityId: cleanUsername }
+  );
 }
 
 // 3. CONFIG (Kriteria & Bobot)
 export function subscribeToConfig(
-  onUpdate: (config: any) => void,
+  onUpdate: (config: any, fromCache?: boolean) => void,
   onError?: (err: any) => void
 ) {
   const path = 'config/criteria_config';
@@ -239,7 +540,7 @@ export function subscribeToConfig(
     doc(db, 'config', 'criteria_config'),
     docSnap => {
       if (docSnap.exists()) {
-        onUpdate(docSnap.data().categories);
+        onUpdate(docSnap.data().categories, docSnap.metadata.fromCache);
       }
     },
     error => {
@@ -249,20 +550,23 @@ export function subscribeToConfig(
   );
 }
 
-export async function saveConfigToCloud(categories: any): Promise<{ success: boolean; error?: string }> {
+export async function saveConfigToCloud(
+  categories: any,
+  options?: CloudWriteOptions
+): Promise<CloudWriteResult> {
   const path = 'config/criteria_config';
-  try {
-    const cleanDoc = sanitizeForFirestore({
-      id: 'criteria_config',
-      categories,
-      updatedAt: new Date().toISOString()
-    });
-    await setDoc(doc(db, 'config', 'criteria_config'), cleanDoc);
-    return { success: true };
-  } catch (error) {
-    const errInfo = handleFirestoreError(error, OperationType.WRITE, path);
-    return { success: false, error: errInfo.error };
-  }
+  const cleanDoc = sanitizeForFirestore({
+    id: 'criteria_config',
+    categories,
+    updatedAt: new Date().toISOString()
+  });
+  return executeCloudMutation(
+    () => setDoc(doc(db, 'config', 'criteria_config'), cleanDoc),
+    OperationType.WRITE,
+    path,
+    options,
+    { type: 'config_save', entityId: 'criteria_config', payload: categories }
+  );
 }
 
 // 4. LOGO (Pengaturan Logo Aplikasi)
@@ -285,71 +589,150 @@ export function subscribeToLogo(
   );
 }
 
-export async function saveLogoToCloud(logoUrl: string | null): Promise<{ success: boolean; error?: string }> {
+export async function saveLogoToCloud(
+  logoUrl: string | null,
+  options?: CloudWriteOptions
+): Promise<CloudWriteResult> {
   const path = 'settings/global_logo';
+  const cleanDoc = sanitizeForFirestore({
+    id: 'global_logo',
+    logoUrl: logoUrl || '',
+    updatedAt: new Date().toISOString()
+  });
+  return executeCloudMutation(
+    () => setDoc(doc(db, 'settings', 'global_logo'), cleanDoc),
+    OperationType.WRITE,
+    path,
+    options,
+    { type: 'logo_save', entityId: 'global_logo', payload: logoUrl }
+  );
+}
+
+// 5. REGISTRATIONS (Formulir Pendaftaran PKS) + Offline Local Cache Overlay
+const REGISTRATIONS_CACHE_KEY = 'PBB_PKS_REGISTRATIONS_CACHE_V1';
+const registrationLocalOverlayListeners = new Set<() => void>();
+
+export function getCachedRegistrationsFromLocal(): any[] {
   try {
-    const cleanDoc = sanitizeForFirestore({
-      id: 'global_logo',
-      logoUrl: logoUrl || '',
-      updatedAt: new Date().toISOString()
-    });
-    await setDoc(doc(db, 'settings', 'global_logo'), cleanDoc);
-    return { success: true };
-  } catch (error) {
-    const errInfo = handleFirestoreError(error, OperationType.WRITE, path);
-    return { success: false, error: errInfo.error };
+    if (typeof window === 'undefined' || !window.localStorage) return [];
+    const raw = window.localStorage.getItem(REGISTRATIONS_CACHE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
   }
 }
 
-// 5. REGISTRATIONS (Formulir Pendaftaran PKS)
+export function cacheRegistrationsToLocal(items: any[]): void {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.setItem(REGISTRATIONS_CACHE_KEY, JSON.stringify(items));
+    }
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+function applyOfflineRegistrationOverlay(baseItems: any[]): any[] {
+  const queue = getOfflineQueue();
+  let merged = [...baseItems];
+  for (const item of queue) {
+    if (item.type === 'registration_save' && item.payload) {
+      const idx = merged.findIndex(r => r.id === item.entityId);
+      if (idx >= 0) {
+        merged[idx] = item.payload;
+      } else {
+        merged = [item.payload, ...merged];
+      }
+    } else if (item.type === 'registration_delete') {
+      merged = merged.filter(r => r.id !== item.entityId);
+    }
+  }
+  return merged;
+}
+
 export function subscribeToRegistrations(
   onUpdate: (submissions: any[]) => void,
   onError?: (err: any) => void
 ) {
   const path = 'registrations';
-  return onSnapshot(
+  let latestServerOrCache = getCachedRegistrationsFromLocal();
+
+  const emitMerged = (base: any[]) => {
+    const merged = applyOfflineRegistrationOverlay(base);
+    cacheRegistrationsToLocal(merged);
+    onUpdate(merged);
+  };
+
+  const localOverlayHandler = () => {
+    emitMerged(latestServerOrCache);
+  };
+  registrationLocalOverlayListeners.add(localOverlayHandler);
+
+  const unsubFirestore = onSnapshot(
     collection(db, path),
     snapshot => {
       const items: any[] = [];
       snapshot.forEach(docSnap => {
         items.push(docSnap.data());
       });
-      onUpdate(items);
+      latestServerOrCache = items;
+      emitMerged(items);
     },
     error => {
       handleFirestoreError(error, OperationType.LIST, path);
       if (onError) onError(error);
     }
   );
+
+  return () => {
+    registrationLocalOverlayListeners.delete(localOverlayHandler);
+    unsubFirestore();
+  };
 }
 
-export async function saveRegistrationToCloud(submission: any): Promise<{ success: boolean; error?: string }> {
+export async function saveRegistrationToCloud(
+  submission: any,
+  options?: CloudWriteOptions
+): Promise<CloudWriteResult> {
   if (!submission || !submission.id) {
     return { success: false, error: 'ID formulir tidak valid' };
   }
   const path = `registrations/${submission.id}`;
-  try {
-    const cleanDoc = sanitizeForFirestore({
-      ...submission,
-      updatedAt: new Date().toISOString()
-    });
-    await setDoc(doc(db, 'registrations', submission.id), cleanDoc);
-    return { success: true };
-  } catch (error) {
-    const errInfo = handleFirestoreError(error, OperationType.WRITE, path);
-    return { success: false, error: errInfo.error };
+  const cleanDoc = sanitizeForFirestore({
+    ...submission,
+    updatedAt: new Date().toISOString()
+  });
+  const res = await executeCloudMutation(
+    () => setDoc(doc(db, 'registrations', submission.id), cleanDoc),
+    OperationType.WRITE,
+    path,
+    options,
+    { type: 'registration_save', entityId: submission.id, payload: cleanDoc }
+  );
+  if (res.queuedOffline) {
+    registrationLocalOverlayListeners.forEach(cb => cb());
   }
+  return res;
 }
 
-export async function deleteRegistrationFromCloud(submissionId: string): Promise<{ success: boolean; error?: string }> {
+export async function deleteRegistrationFromCloud(
+  submissionId: string,
+  options?: CloudWriteOptions
+): Promise<CloudWriteResult> {
   const path = `registrations/${submissionId}`;
-  try {
-    await deleteDoc(doc(db, 'registrations', submissionId));
-    return { success: true };
-  } catch (error) {
-    const errInfo = handleFirestoreError(error, OperationType.DELETE, path);
-    return { success: false, error: errInfo.error };
+  const res = await executeCloudMutation(
+    () => deleteDoc(doc(db, 'registrations', submissionId)),
+    OperationType.DELETE,
+    path,
+    options,
+    { type: 'registration_delete', entityId: submissionId }
+  );
+  if (res.queuedOffline) {
+    registrationLocalOverlayListeners.forEach(cb => cb());
   }
+  return res;
 }
 
 // 6. APP STATUS & MAINTENANCE (Aktivasi / Nonaktivasi Aplikasi dengan Kustomisasi Teks)
@@ -395,25 +778,28 @@ export function subscribeToAppStatus(
   );
 }
 
-export async function saveAppStatusToCloud(status: AppStatusConfig): Promise<{ success: boolean; error?: string }> {
+export async function saveAppStatusToCloud(
+  status: AppStatusConfig,
+  options?: CloudWriteOptions
+): Promise<CloudWriteResult> {
   const path = 'settings/app_status';
-  try {
-    const cleanDoc = sanitizeForFirestore({
-      id: 'app_status',
-      isActive: status.isActive,
-      title: status.title,
-      message: status.message,
-      estimateTime: status.estimateTime || '',
-      contactInfo: status.contactInfo || '',
-      updatedAt: new Date().toISOString(),
-      updatedBy: status.updatedBy || 'admin'
-    });
-    await setDoc(doc(db, 'settings', 'app_status'), cleanDoc);
-    return { success: true };
-  } catch (error) {
-    const errInfo = handleFirestoreError(error, OperationType.WRITE, path);
-    return { success: false, error: errInfo.error };
-  }
+  const cleanDoc = sanitizeForFirestore({
+    id: 'app_status',
+    isActive: status.isActive,
+    title: status.title,
+    message: status.message,
+    estimateTime: status.estimateTime || '',
+    contactInfo: status.contactInfo || '',
+    updatedAt: new Date().toISOString(),
+    updatedBy: status.updatedBy || 'admin'
+  });
+  return executeCloudMutation(
+    () => setDoc(doc(db, 'settings', 'app_status'), cleanDoc),
+    OperationType.WRITE,
+    path,
+    options,
+    { type: 'app_status_save', entityId: 'app_status', payload: cleanDoc }
+  );
 }
 
 // 7. PAYMENT GATEWAY & REGISTRATION FEE CONFIGURATION
@@ -592,20 +978,23 @@ export function subscribeToPaymentConfig(
   );
 }
 
-export async function savePaymentConfigToCloud(config: PaymentConfig): Promise<{ success: boolean; error?: string }> {
+export async function savePaymentConfigToCloud(
+  config: PaymentConfig,
+  options?: CloudWriteOptions
+): Promise<CloudWriteResult> {
   const path = 'settings/payment_config';
-  try {
-    const cleanDoc = sanitizeForFirestore({
-      ...config,
-      id: 'payment_config',
-      updatedAt: new Date().toISOString()
-    });
-    await setDoc(doc(db, 'settings', 'payment_config'), cleanDoc);
-    return { success: true };
-  } catch (error) {
-    const errInfo = handleFirestoreError(error, OperationType.WRITE, path);
-    return { success: false, error: errInfo.error };
-  }
+  const cleanDoc = sanitizeForFirestore({
+    ...config,
+    id: 'payment_config',
+    updatedAt: new Date().toISOString()
+  });
+  return executeCloudMutation(
+    () => setDoc(doc(db, 'settings', 'payment_config'), cleanDoc),
+    OperationType.WRITE,
+    path,
+    options,
+    { type: 'payment_config_save', entityId: 'payment_config', payload: cleanDoc }
+  );
 }
 
 // ==========================================
@@ -749,19 +1138,199 @@ export function subscribeToBlankoConfig(
   );
 }
 
-export async function saveBlankoConfigToCloud(config: BlankoConfig): Promise<{ success: boolean; error?: string }> {
+export async function saveBlankoConfigToCloud(
+  config: BlankoConfig,
+  options?: CloudWriteOptions
+): Promise<CloudWriteResult> {
   const path = 'settings/blanko_config';
+  const cleanDoc = sanitizeForFirestore({
+    ...config,
+    id: 'blanko_config',
+    updatedAt: new Date().toISOString()
+  });
+  return executeCloudMutation(
+    () => setDoc(doc(db, 'settings', 'blanko_config'), cleanDoc),
+    OperationType.WRITE,
+    path,
+    options,
+    { type: 'blanko_config_save', entityId: 'blanko_config', payload: cleanDoc }
+  );
+}
+
+// ==========================================
+// 8. LEGACY ACTIVITY LOGS CLEANUP (QUOTA SAVER)
+// ==========================================
+
+const LEGACY_ACTIVITY_LOGS_STORAGE_KEY = 'pks_activity_logs_v1';
+const LEGACY_ACTIVITY_LOGS_DOC_ID = 'activity_logs_store';
+const LEGACY_LOG_PURGE_DONE_KEY = 'pks_legacy_activity_logs_purged_v1';
+
+export function clearLegacyLocalActivityLogs(): void {
   try {
-    const cleanDoc = sanitizeForFirestore({
-      ...config,
-      id: 'blanko_config',
-      updatedAt: new Date().toISOString()
-    });
-    await setDoc(doc(db, 'settings', 'blanko_config'), cleanDoc);
-    return { success: true };
-  } catch (error) {
-    const errInfo = handleFirestoreError(error, OperationType.WRITE, path);
-    return { success: false, error: errInfo.error };
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.removeItem(LEGACY_ACTIVITY_LOGS_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage errors
   }
 }
+
+export async function purgeLegacyActivityLogsFromCloudAndLocal(): Promise<void> {
+  clearLegacyLocalActivityLogs();
+
+  try {
+    if (typeof window !== 'undefined' && window.localStorage.getItem(LEGACY_LOG_PURGE_DONE_KEY) === '1') {
+      return;
+    }
+  } catch {
+    // ignore storage errors
+  }
+
+  if ((typeof navigator !== 'undefined' && !navigator.onLine) || isCloudWriteQuotaExceeded()) {
+    return;
+  }
+
+  try {
+    await deleteDoc(doc(db, 'settings', LEGACY_ACTIVITY_LOGS_DOC_ID));
+
+    let batchRounds = 0;
+    let hasMoreLegacyDocs = false;
+    while (batchRounds < 5 && !isCloudWriteQuotaExceeded()) {
+      batchRounds += 1;
+      const snap = await getDocs(query(collection(db, 'activity_logs'), limit(50)));
+      if (snap.empty) {
+        hasMoreLegacyDocs = false;
+        break;
+      }
+      for (const d of snap.docs) {
+        if (isCloudWriteQuotaExceeded()) break;
+        await deleteDoc(d.ref);
+      }
+      hasMoreLegacyDocs = snap.size === 50;
+      if (!hasMoreLegacyDocs) break;
+    }
+
+    if (!hasMoreLegacyDocs && !isCloudWriteQuotaExceeded()) {
+      try {
+        if (typeof window !== 'undefined' && window.localStorage) {
+          window.localStorage.setItem(LEGACY_LOG_PURGE_DONE_KEY, '1');
+        }
+      } catch {
+        // ignore
+      }
+    }
+  } catch (error) {
+    if (isQuotaExceededError(error)) {
+      markCloudWriteQuotaExceeded();
+    }
+  }
+}
+
+// ==========================================
+// 9. OFFLINE QUEUE AUTO-FLUSH MANAGER
+// ==========================================
+
+export interface OfflineFlushSummary {
+  flushedCount: number;
+  remainingCount: number;
+  hadQuotaError: boolean;
+  hadNetworkError: boolean;
+}
+
+let activeFlushPromise: Promise<OfflineFlushSummary> | null = null;
+
+export async function flushOfflineSyncQueue(): Promise<OfflineFlushSummary> {
+  if (activeFlushPromise) return activeFlushPromise;
+
+  activeFlushPromise = (async () => {
+    const queue = getOfflineQueue();
+    if (queue.length === 0) {
+      return { flushedCount: 0, remainingCount: 0, hadQuotaError: false, hadNetworkError: false };
+    }
+
+    if ((typeof navigator !== 'undefined' && !navigator.onLine) || isCloudWriteQuotaExceeded()) {
+      return {
+        flushedCount: 0,
+        remainingCount: queue.length,
+        hadQuotaError: isCloudWriteQuotaExceeded(),
+        hadNetworkError: typeof navigator !== 'undefined' ? !navigator.onLine : false
+      };
+    }
+
+    let flushedCount = 0;
+    let hadQuotaError = false;
+    let hadNetworkError = false;
+
+    for (const item of queue) {
+      let res: CloudWriteResult = { success: true };
+      const opts: CloudWriteOptions = { skipOfflineQueue: true };
+
+      switch (item.type) {
+        case 'participant_save':
+          res = await saveParticipantToCloud(item.payload, opts);
+          break;
+        case 'participant_delete':
+          res = await deleteParticipantFromCloud(item.entityId, opts);
+          break;
+        case 'user_save':
+          res = await saveUserToCloud(item.payload, opts);
+          break;
+        case 'user_delete':
+          res = await deleteUserFromCloud(item.entityId, opts);
+          break;
+        case 'config_save':
+          res = await saveConfigToCloud(item.payload, opts);
+          break;
+        case 'logo_save':
+          res = await saveLogoToCloud(item.payload, opts);
+          break;
+        case 'app_status_save':
+          res = await saveAppStatusToCloud(item.payload, opts);
+          break;
+        case 'payment_config_save':
+          res = await savePaymentConfigToCloud(item.payload, opts);
+          break;
+        case 'blanko_config_save':
+          res = await saveBlankoConfigToCloud(item.payload, opts);
+          break;
+        case 'registration_save':
+          res = await saveRegistrationToCloud(item.payload, opts);
+          break;
+        case 'registration_delete':
+          res = await deleteRegistrationFromCloud(item.entityId, opts);
+          break;
+      }
+
+      if (res.success) {
+        removeOfflineMutation(item.key);
+        flushedCount += 1;
+      } else if (res.isQuotaError) {
+        hadQuotaError = true;
+        break;
+      } else if (res.isNetworkError) {
+        hadNetworkError = true;
+        break;
+      } else {
+        // Non-retryable payload/permission error: drop from queue so it doesn't block subsequent items
+        removeOfflineMutation(item.key);
+      }
+    }
+
+    return {
+      flushedCount,
+      remainingCount: getOfflineQueue().length,
+      hadQuotaError,
+      hadNetworkError
+    };
+  })();
+
+  try {
+    return await activeFlushPromise;
+  } finally {
+    activeFlushPromise = null;
+  }
+}
+
+
+
 

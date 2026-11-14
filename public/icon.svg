@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="55%" stop-color="#1e3a8a" />
+      <stop offset="100%" stop-color="#2563eb" />
+    </linearGradient>
+    <linearGradient id="shieldGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#60a5fa" />
+      <stop offset="100%" stop-color="#2563eb" />
+    </linearGradient>
+    <linearGradient id="goldGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fde047" />
+      <stop offset="100%" stop-color="#f59e0b" />
+    </linearGradient>
+  </defs>
+
+  <!-- Full-bleed dark navy-blue rounded background -->
+  <rect width="512" height="512" rx="112" fill="url(#bgGrad)" />
+
+  <!-- Subtle outer highlight ring -->
+  <rect x="20" y="20" width="472" height="472" rx="96" fill="none" stroke="#93c5fd" stroke-opacity="0.22" stroke-width="6" />
+
+  <!-- Official PKS Shield Silhouette -->
+  <path
+    d="M256 76 L396 128 V246 C396 340 335 406 256 440 C177 406 116 340 116 246 V128 Z"
+    fill="#0b1530"
+    stroke="url(#goldGrad)"
+    stroke-width="14"
+    stroke-linejoin="round"
+  />
+
+  <!-- Inner Shield Accent -->
+  <path
+    d="M256 104 L368 146 V244 C368 320 318 375 256 406 C194 375 144 320 144 244 V146 Z"
+    fill="url(#shieldGrad)"
+    fill-opacity="0.92"
+  />
+
+  <!-- Double Chevrons (PKS Ranks / Satlantas Motif) -->
+  <path d="M188 206 L256 168 L324 206 L324 232 L256 194 L188 232 Z" fill="#ffffff" />
+  <path d="M188 250 L256 212 L324 250 L324 276 L256 238 L188 276 Z" fill="url(#goldGrad)" />
+
+  <!-- Bold Wordmark E-PKS -->
+  <text
+    x="256"
+    y="336"
+    text-anchor="middle"
+    font-family="Arial, Helvetica, sans-serif"
+    font-weight="900"
+    font-size="56"
+    letter-spacing="2"
+    fill="#ffffff"
+  >PKS</text>
+  <text
+    x="256"
+    y="370"
+    text-anchor="middle"
+    font-family="Arial, Helvetica, sans-serif"
+    font-weight="800"
+    font-size="22"
+    letter-spacing="4"
+    fill="#fde047"
+  >SATU</text>
+</svg>

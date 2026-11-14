@@ -41,6 +41,13 @@ service cloud.firestore {
       allow write: if isValidId(registrationId);
     }
 
+    // Legacy activity_logs collection (disabled for new writes; read & delete allowed only for automatic cleanup)
+    match /activity_logs/{logId} {
+      allow read: if true;
+      allow create, update: if false;
+      allow delete: if isValidId(logId);
+    }
+
     // Test connection doc
     match /test/{docId} {
       allow read, write: if true;

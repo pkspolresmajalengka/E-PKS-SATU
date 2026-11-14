@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import {
   Building2,
@@ -18,7 +18,8 @@ import {
   UserCheck,
   Copy,
   Lock,
-  Plus
+  Plus,
+  Loader2
 } from 'lucide-react';
 import { AppUser, Participant, SchoolLevel } from '../App';
 import {
@@ -26,6 +27,7 @@ import {
   deleteUserFromCloud,
   saveParticipantToCloud
 } from '../lib/firebase';
+import { NetworkErrorBanner, NetworkErrorState } from './NetworkErrorBanner';
 
 interface SchoolAccountManagerModalProps {
   isOpen: boolean;
@@ -71,6 +73,20 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
   });
 
   const [formError, setFormError] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+  const [deletingUsername, setDeletingUsername] = useState<string | null>(null);
+  const [confirmDeleteUser, setConfirmDeleteUser] = useState<AppUser | null>(null);
+  const [networkError, setNetworkError] = useState<NetworkErrorState | null>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      setFormError('');
+      setNetworkError(null);
+      setEditingTargetUsername(null);
+      setConfirmDeleteUser(null);
+      setActiveTab('list');
+    }
+  }, [isOpen]);
 
   // Filtered school accounts list
   const schoolAccounts = useMemo(() => {
@@ -171,9 +187,11 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
     setActiveTab('edit');
   };
 
-  const handleSaveNewSchool = (e: React.FormEvent) => {
+  const handleSaveNewSchool = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSaving) return;
     setFormError('');
+    setNetworkError(null);
 
     const school = formData.schoolName.trim();
     const uname = formData.username.trim().toLowerCase().replace(/\s+/g, '');
@@ -197,70 +215,104 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
       return;
     }
 
-    const newSchoolUser: AppUser = {
-      username: uname,
-      password: pwd,
-      name: school,
-      role: 'sekolah',
-      schoolName: school,
-      schoolLevel: formData.schoolLevel,
-      pembinaName: formData.pembinaName.trim(),
-      contactWa: formData.contactWa.trim(),
-      isCustom: true
+    setIsSaving(true);
+    setNetworkError(null);
+
+    const runCreateSave = async () => {
+      const newSchoolUser: AppUser = {
+        username: uname,
+        password: pwd,
+        name: school,
+        role: 'sekolah',
+        schoolName: school,
+        schoolLevel: formData.schoolLevel,
+        pembinaName: formData.pembinaName.trim(),
+        contactWa: formData.contactWa.trim(),
+        isCustom: true
+      };
+
+      const userSyncRes = await saveUserToCloud(newSchoolUser);
+      if (!userSyncRes.success && !userSyncRes.queuedOffline) {
+        setNetworkError({
+          title: 'Gagal Menyimpan Akun Sekolah ke Cloud',
+          message: userSyncRes.error || 'Terjadi gangguan jaringan saat menyimpan akun sekolah.',
+          isNetworkError: userSyncRes.isNetworkError,
+          onRetry: async () => {
+            setIsSaving(true);
+            setNetworkError(null);
+            try {
+              await runCreateSave();
+            } finally {
+              setIsSaving(false);
+            }
+          }
+        });
+        showToast(userSyncRes.error || 'Gagal menyimpan akun sekolah ke Cloud.', 'error');
+        return;
+      }
+
+      const updatedUsers = [...usersList, newSchoolUser];
+      setUsersList(updatedUsers);
+      try {
+        localStorage.setItem('PBB_PKS_USERS_V4_DATA', JSON.stringify(updatedUsers));
+      } catch {
+        // ignore
+      }
+
+      // Auto-create initial participant profile for this school if requested and doesn't exist yet
+      if (formData.autoCreatePeserta) {
+        const exists = pesertaList.some(
+          p => p.sekolah.toLowerCase().trim() === school.toLowerCase().trim()
+        );
+        if (!exists) {
+          const nextNo = String(pesertaList.length + 1).padStart(2, '0');
+          const newPeserta: Participant = {
+            id: `p-${Date.now()}`,
+            nomor: nextNo,
+            peleton: `Peleton ${school}`,
+            jenjang: formData.schoolLevel,
+            sekolah: school,
+            tanggal: new Date().toISOString().split('T')[0],
+            juri: 'Belum Ditentukan',
+            scores: {
+              pbb: {}, danton: {},
+              devile: {}, gatur: {}, senam: {}, yelyel: {},
+              beladiri: {}, speaking: {}, tenda: {}
+            }
+          };
+          const updatedPeserta = [...pesertaList, newPeserta];
+          setPesertaList(updatedPeserta);
+          try {
+            localStorage.setItem('PBB_PKS_REKAP_APP_V4_DATA', JSON.stringify({ pesertaList: updatedPeserta }));
+          } catch {
+            // ignore
+          }
+          await saveParticipantToCloud(newPeserta);
+        }
+      }
+
+      showToast(
+        userSyncRes.queuedOffline
+          ? `Akun sekolah "${school}" disimpan offline & akan otomatis tersinkron saat online.`
+          : `Akun sekolah "${school}" berhasil dibuat & tersinkron ke Cloud!`,
+        userSyncRes.queuedOffline ? 'info' : 'success'
+      );
+      resetForm();
+      setActiveTab('list');
     };
 
-    const updatedUsers = [...usersList, newSchoolUser];
-    setUsersList(updatedUsers);
     try {
-      localStorage.setItem('PBB_PKS_USERS_V4_DATA', JSON.stringify(updatedUsers));
-    } catch {
-      // ignore
+      await runCreateSave();
+    } finally {
+      setIsSaving(false);
     }
-    // Sync to Cloud Firestore
-    saveUserToCloud(newSchoolUser);
-
-    // Auto-create initial participant profile for this school if requested and doesn't exist yet
-    if (formData.autoCreatePeserta) {
-      const exists = pesertaList.some(
-        p => p.sekolah.toLowerCase().trim() === school.toLowerCase().trim()
-      );
-      if (!exists) {
-        const nextNo = String(pesertaList.length + 1).padStart(2, '0');
-        const newPeserta: Participant = {
-          id: `p-${Date.now()}`,
-          nomor: nextNo,
-          peleton: `Peleton ${school}`,
-          jenjang: formData.schoolLevel,
-          sekolah: school,
-          tanggal: new Date().toISOString().split('T')[0],
-          juri: 'Belum Ditentukan',
-          scores: {
-            pbb: {}, variasi: {}, formasi: {}, danton: {},
-            devile: {}, gatur: {}, senam: {}, yelyel: {},
-            beladiri: {}, speaking: {}, tenda: {}
-          }
-        };
-        const updatedPeserta = [...pesertaList, newPeserta];
-        setPesertaList(updatedPeserta);
-        try {
-          localStorage.setItem('PBB_PKS_REKAP_APP_V4_DATA', JSON.stringify({ pesertaList: updatedPeserta, history: [] }));
-        } catch {
-          // ignore
-        }
-        // Sync participant to Cloud Firestore
-        saveParticipantToCloud(newPeserta);
-      }
-    }
-
-    showToast(`Akun sekolah "${school}" berhasil dibuat!`, 'success');
-    resetForm();
-    setActiveTab('list');
   };
 
-  const handleUpdateSchool = (e: React.FormEvent) => {
+  const handleUpdateSchool = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingTargetUsername) return;
     setFormError('');
+    setNetworkError(null);
 
     const school = formData.schoolName.trim();
     const uname = formData.username.trim().toLowerCase().replace(/\s+/g, '');
@@ -300,43 +352,75 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
       isCustom: true
     };
 
-    const updatedUsers = usersList.map(u =>
-      u.username === editingTargetUsername ? updatedUser : u
-    );
-    setUsersList(updatedUsers);
+    setIsSaving(true);
+    const runUpdateSave = async () => {
+      const syncRes = await saveUserToCloud(updatedUser);
+      if (!syncRes.success && !syncRes.queuedOffline) {
+        setNetworkError({
+          title: 'Gagal Memperbarui Akun Sekolah di Cloud',
+          message: syncRes.error || 'Terjadi gangguan jaringan saat menyimpan perubahan akun sekolah.',
+          isNetworkError: syncRes.isNetworkError,
+          onRetry: async () => {
+            setIsSaving(true);
+            setNetworkError(null);
+            try {
+              await runUpdateSave();
+            } finally {
+              setIsSaving(false);
+            }
+          }
+        });
+        showToast(syncRes.error || 'Gagal memperbarui akun sekolah ke Cloud.', 'error');
+        return;
+      }
+
+      const updatedUsers = usersList.map(u =>
+        u.username === editingTargetUsername ? updatedUser : u
+      );
+      setUsersList(updatedUsers);
+      try {
+        localStorage.setItem('PBB_PKS_USERS_V4_DATA', JSON.stringify(updatedUsers));
+      } catch {
+        // ignore
+      }
+
+      // If currently logged in as this school user, sync
+      if (currentUser && currentUser.username === editingTargetUsername) {
+        setCurrentUser(updatedUser);
+        sessionStorage.setItem('PBB_PKS_ACTIVE_AUTH_SESSION', JSON.stringify(updatedUser));
+      }
+
+      showToast(`Data akun sekolah "${school}" berhasil diperbarui & tersinkron ke Cloud!`, 'success');
+      resetForm();
+      setActiveTab('list');
+    };
+
     try {
-      localStorage.setItem('PBB_PKS_USERS_V4_DATA', JSON.stringify(updatedUsers));
-    } catch {
-      // ignore
+      await runUpdateSave();
+    } finally {
+      setIsSaving(false);
     }
-    // Sync update to Cloud Firestore
-    saveUserToCloud(updatedUser);
-
-    // If currently logged in as this school user, sync
-    if (currentUser && currentUser.username === editingTargetUsername) {
-      setCurrentUser(updatedUser);
-      sessionStorage.setItem('PBB_PKS_ACTIVE_AUTH_SESSION', JSON.stringify(updatedUser));
-    }
-
-    showToast(`Data akun sekolah "${school}" berhasil diperbarui!`, 'success');
-    resetForm();
-    setActiveTab('list');
   };
 
-  const handleDeleteSchool = (user: AppUser) => {
-    if (currentUser && currentUser.username === user.username) {
-      showToast('Tidak dapat menghapus akun sekolah yang sedang login saat ini!', 'error');
-      return;
-    }
-
+  const executeDeleteSchool = async (user: AppUser) => {
     const school = user.schoolName || user.name;
-    const count = schoolPesertaCountMap[school.toLowerCase().trim()] || 0;
+    setDeletingUsername(user.username);
+    setNetworkError(null);
 
-    const confirmMsg = count > 0
-      ? `Yakin ingin menghapus akun sekolah "${school}" (@${user.username})? Sekolah ini memiliki ${count} kontingen/peserta terdaftar.`
-      : `Yakin ingin menghapus akun sekolah "${school}" (@${user.username})?`;
+    try {
+      const delRes = await deleteUserFromCloud(user.username);
+      if (!delRes.success && !delRes.queuedOffline) {
+        setConfirmDeleteUser(null);
+        setNetworkError({
+          title: 'Gagal Menghapus Akun Sekolah dari Cloud',
+          message: delRes.error || 'Terjadi gangguan jaringan saat menghapus akun sekolah.',
+          isNetworkError: delRes.isNetworkError,
+          onRetry: () => executeDeleteSchool(user)
+        });
+        showToast(delRes.error || 'Gagal menghapus akun sekolah dari Cloud.', 'error');
+        return;
+      }
 
-    if (window.confirm(confirmMsg)) {
       const updatedUsers = usersList.filter(u => u.username !== user.username);
       setUsersList(updatedUsers);
       try {
@@ -344,10 +428,19 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
       } catch {
         // ignore
       }
-      // Sync delete to Cloud Firestore
-      deleteUserFromCloud(user.username);
-      showToast(`Akun sekolah "${school}" berhasil dihapus.`, 'info');
+      setConfirmDeleteUser(null);
+      showToast(`Akun sekolah "${school}" berhasil dihapus dari Cloud.`, 'info');
+    } finally {
+      setDeletingUsername(null);
     }
+  };
+
+  const handleDeleteSchool = (user: AppUser) => {
+    if (currentUser && currentUser.username === user.username) {
+      showToast('Tidak dapat menghapus akun sekolah yang sedang login saat ini!', 'error');
+      return;
+    }
+    setConfirmDeleteUser(user);
   };
 
   // Export School Credentials to Excel
@@ -432,8 +525,10 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
             </div>
           </div>
           <button
+            type="button"
+            disabled={isSaving || Boolean(deletingUsername)}
             onClick={onClose}
-            className="text-slate-400 hover:text-white p-1 rounded-lg cursor-pointer"
+            className="text-slate-400 hover:text-white disabled:opacity-50 p-1 rounded-lg cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -491,6 +586,7 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
         {/* ==================================================== */}
         {activeTab === 'list' && (
           <div className="p-5 overflow-y-auto flex-1 space-y-4">
+            <NetworkErrorBanner error={networkError} onDismiss={() => setNetworkError(null)} />
             {/* Search & Filter Toolbar */}
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="flex flex-wrap items-center gap-2 flex-1">
@@ -712,11 +808,16 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
 
                                 <button
                                   type="button"
+                                  disabled={deletingUsername === u.username}
                                   onClick={() => handleDeleteSchool(u)}
                                   title="Hapus Akun Sekolah"
-                                  className="p-1.5 text-rose-600 hover:bg-rose-50 rounded-lg transition cursor-pointer"
+                                  className="p-1.5 text-rose-600 hover:bg-rose-50 disabled:opacity-60 rounded-lg transition cursor-pointer"
                                 >
-                                  <Trash2 className="w-3.5 h-3.5" />
+                                  {deletingUsername === u.username ? (
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                  ) : (
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  )}
                                 </button>
                               </div>
                             </td>
@@ -746,9 +847,11 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
               </p>
             </div>
 
+            <NetworkErrorBanner error={networkError} onDismiss={() => setNetworkError(null)} />
+
             {formError && (
-              <div className="bg-rose-50 border-l-4 border-rose-500 p-3 rounded-r text-xs text-rose-700 flex items-center gap-2">
-                <AlertTriangle className="w-4 h-4 text-rose-500 shrink-0" />
+              <div className="bg-rose-50 border border-rose-300 p-3 rounded-xl text-xs text-rose-800 flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
                 <span>{formError}</span>
               </div>
             )}
@@ -883,16 +986,31 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
             <div className="pt-4 border-t border-slate-200 flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => setActiveTab('list')}
-                className="px-4 py-2 border border-slate-300 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-100 cursor-pointer"
+                disabled={isSaving}
+                onClick={() => {
+                  setNetworkError(null);
+                  setActiveTab('list');
+                }}
+                className="px-4 py-2 border border-slate-300 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
               >
                 Batal
               </button>
               <button
                 type="submit"
-                className="px-5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl shadow cursor-pointer flex items-center gap-1.5"
+                disabled={isSaving}
+                className="px-5 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-75 text-white text-xs font-bold rounded-xl shadow cursor-pointer flex items-center gap-1.5"
               >
-                <Check className="w-4 h-4" /> Simpan Akun Sekolah
+                {isSaving ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Menyimpan...</span>
+                  </>
+                ) : (
+                  <>
+                    <Check className="w-4 h-4" />
+                    <span>Simpan Akun Sekolah</span>
+                  </>
+                )}
               </button>
             </div>
           </form>
@@ -915,9 +1033,11 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
               </div>
             </div>
 
+            <NetworkErrorBanner error={networkError} onDismiss={() => setNetworkError(null)} />
+
             {formError && (
-              <div className="bg-rose-50 border-l-4 border-rose-500 p-3 rounded-r text-xs text-rose-700 flex items-center gap-2">
-                <AlertTriangle className="w-4 h-4 text-rose-500 shrink-0" />
+              <div className="bg-rose-50 border border-rose-300 p-3 rounded-xl text-xs text-rose-800 flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
                 <span>{formError}</span>
               </div>
             )}
@@ -1036,24 +1156,108 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
             <div className="pt-4 border-t border-slate-200 flex justify-end gap-2">
               <button
                 type="button"
+                disabled={isSaving}
                 onClick={() => {
+                  setNetworkError(null);
                   resetForm();
                   setActiveTab('list');
                 }}
-                className="px-4 py-2 border border-slate-300 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-100 cursor-pointer"
+                className="px-4 py-2 border border-slate-300 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
               >
                 Batal
               </button>
               <button
                 type="submit"
-                className="px-5 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-xl shadow cursor-pointer flex items-center gap-1.5"
+                disabled={isSaving}
+                className="px-5 py-2 bg-amber-600 hover:bg-amber-700 disabled:opacity-75 text-white text-xs font-bold rounded-xl shadow cursor-pointer flex items-center gap-1.5"
               >
-                <Check className="w-4 h-4" /> Simpan Perubahan Akun Sekolah
+                {isSaving ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Menyimpan...</span>
+                  </>
+                ) : (
+                  <>
+                    <Check className="w-4 h-4" />
+                    <span>Simpan Perubahan Akun Sekolah</span>
+                  </>
+                )}
               </button>
             </div>
           </form>
         )}
       </div>
+
+      {/* IN-APP DELETE CONFIRMATION DIALOG */}
+      {confirmDeleteUser && (
+        <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-xs z-[60] flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full overflow-hidden border border-slate-200">
+            <div className="bg-slate-900 text-white px-5 py-4 flex items-center justify-between border-b border-slate-800">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 bg-rose-600/20 border border-rose-500/40 rounded-xl text-rose-400">
+                  <Trash2 className="w-4 h-4" />
+                </div>
+                <div>
+                  <h4 className="font-bold text-sm text-white">Hapus Akun Sekolah?</h4>
+                  <p className="text-[11px] text-slate-400">@{confirmDeleteUser.username}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={deletingUsername === confirmDeleteUser.username}
+                onClick={() => setConfirmDeleteUser(null)}
+                className="text-slate-400 hover:text-white disabled:opacity-50 p-1 rounded-lg cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-5 space-y-4 text-xs text-slate-700">
+              {(() => {
+                const school = confirmDeleteUser.schoolName || confirmDeleteUser.name;
+                const count = schoolPesertaCountMap[school.toLowerCase().trim()] || 0;
+                return (
+                  <p className="leading-relaxed">
+                    Yakin ingin menghapus akun sekolah <strong className="text-slate-900">"{school}"</strong> (@{confirmDeleteUser.username})?
+                    {count > 0 && (
+                      <span className="block mt-1.5 text-amber-700 font-semibold">
+                        Catatan: Sekolah ini memiliki {count} kontingen/peserta terdaftar.
+                      </span>
+                    )}
+                  </p>
+                );
+              })()}
+              <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
+                <button
+                  type="button"
+                  disabled={deletingUsername === confirmDeleteUser.username}
+                  onClick={() => setConfirmDeleteUser(null)}
+                  className="px-4 py-2 border border-slate-300 text-slate-700 hover:bg-slate-100 disabled:opacity-50 rounded-xl font-bold transition cursor-pointer"
+                >
+                  Batal
+                </button>
+                <button
+                  type="button"
+                  disabled={deletingUsername === confirmDeleteUser.username}
+                  onClick={() => executeDeleteSchool(confirmDeleteUser)}
+                  className="px-4 py-2 bg-rose-600 hover:bg-rose-700 disabled:opacity-75 text-white rounded-xl font-bold transition flex items-center gap-1.5 cursor-pointer shadow-xs"
+                >
+                  {deletingUsername === confirmDeleteUser.username ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Menghapus...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Ya, Hapus Akun</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

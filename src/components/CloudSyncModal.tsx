@@ -10,16 +10,24 @@ import {
   Laptop,
   Users,
   ShieldCheck,
-  Check
+  Check,
+  HardDrive
 } from 'lucide-react';
+import { formatCountdownMs } from '../lib/autoBackupManager';
 
 interface CloudSyncModalProps {
   isOpen: boolean;
   onClose: () => void;
   cloudStatus: 'connecting' | 'connected' | 'offline' | 'error';
+  cloudQuotaExceeded?: boolean;
+  pendingOfflineCount?: number;
   lastSynced: Date | null;
   pesertaCount: number;
   usersCount: number;
+  autoSaveEnabled?: boolean;
+  autoBackupEnabled?: boolean;
+  nextBackupAt?: number | null;
+  onOpenAutoBackup?: () => void;
   onForceSyncAll: () => Promise<void>;
   showToast: (message: string, type?: 'success' | 'error' | 'info') => void;
 }
@@ -28,9 +36,15 @@ export const CloudSyncModal: React.FC<CloudSyncModalProps> = ({
   isOpen,
   onClose,
   cloudStatus,
+  cloudQuotaExceeded = false,
+  pendingOfflineCount = 0,
   lastSynced,
   pesertaCount,
   usersCount,
+  autoSaveEnabled = true,
+  autoBackupEnabled = true,
+  nextBackupAt = null,
+  onOpenAutoBackup,
   onForceSyncAll,
   showToast
 }) => {
@@ -83,13 +97,17 @@ export const CloudSyncModal: React.FC<CloudSyncModalProps> = ({
         <div className="p-5 sm:p-6 space-y-4">
           {/* Connection Status Banner */}
           <div className={`p-4 rounded-xl border flex items-center gap-3 ${
-            cloudStatus === 'connected'
+            cloudQuotaExceeded
+              ? 'bg-amber-50 border-amber-300 text-amber-950'
+              : cloudStatus === 'connected'
               ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
               : cloudStatus === 'connecting'
               ? 'bg-amber-50 border-amber-200 text-amber-900'
               : 'bg-rose-50 border-rose-200 text-rose-900'
           }`}>
-            {cloudStatus === 'connected' ? (
+            {cloudQuotaExceeded ? (
+              <AlertCircle className="w-6 h-6 text-amber-600 shrink-0" />
+            ) : cloudStatus === 'connected' ? (
               <CheckCircle2 className="w-6 h-6 text-emerald-600 shrink-0" />
             ) : cloudStatus === 'connecting' ? (
               <RefreshCw className="w-6 h-6 text-amber-600 animate-spin shrink-0" />
@@ -98,17 +116,27 @@ export const CloudSyncModal: React.FC<CloudSyncModalProps> = ({
             )}
             <div>
               <h4 className="font-bold text-sm">
-                {cloudStatus === 'connected'
+                {cloudQuotaExceeded
+                  ? 'Kuota Tulis Harian Cloud Tercapai'
+                  : cloudStatus === 'connected'
                   ? 'Cloud Database Aktif & Terhubung'
                   : cloudStatus === 'connecting'
                   ? 'Sedang Menghubungkan ke Cloud...'
                   : 'Mode Offline / Terputus'}
               </h4>
               <p className="text-xs mt-0.5 opacity-90">
-                {cloudStatus === 'connected'
+                {cloudQuotaExceeded
+                  ? 'Batas tulis gratis harian Cloud Firestore telah penuh dan akan direset otomatis besok. Data tetap aman disimpan di penyimpanan lokal perangkat ini.'
+                  : cloudStatus === 'connected'
                   ? 'Semua perubahan data tersimpan ke Google Cloud secara otomatis dan tersinkronisasi seketika.'
                   : 'Sistem tetap menyimpan data secara lokal dan akan menyinkronkannya saat online.'}
               </p>
+              {cloudQuotaExceeded && (
+                <p className="text-[11px] mt-1.5 font-semibold text-amber-900">
+                  Info kuota (kolom Spark / Enterprise edition):{' '}
+                  <span className="underline">https://firebase.google.com/pricing#cloud-firestore</span>
+                </p>
+              )}
             </div>
           </div>
 
@@ -154,26 +182,62 @@ export const CloudSyncModal: React.FC<CloudSyncModalProps> = ({
             </ul>
           </div>
 
-          {/* Sync Time Details */}
-          <div className="text-[11px] text-slate-500 flex items-center justify-between px-1">
-            <span>Waktu Sinkronisasi Terakhir:</span>
-            <span className="font-semibold text-slate-700">
-              {lastSynced ? lastSynced.toLocaleString('id-ID') : 'Baru saja'}
-            </span>
+          {/* Sync Time, Auto-Save & Offline Queue Details */}
+          <div className="space-y-1.5 px-1">
+            <div className="text-[11px] text-slate-500 flex items-center justify-between">
+              <span>Auto-Save & Cadangan 1 Jam:</span>
+              <span className="font-bold tabular-nums text-slate-700">
+                {autoSaveEnabled ? 'Auto-Save Aktif' : 'Auto-Save Nonaktif'}
+                {' · '}
+                {autoBackupEnabled
+                  ? nextBackupAt
+                    ? `Berikutnya ${formatCountdownMs(Math.max(0, nextBackupAt - Date.now()))}`
+                    : 'Jadwal 1 Jam Aktif'
+                  : 'Cadangan Dijeda'}
+              </span>
+            </div>
+            <div className="text-[11px] text-slate-500 flex items-center justify-between">
+              <span>Antrean Perubahan Offline:</span>
+              <span className={`font-bold tabular-nums ${pendingOfflineCount > 0 ? 'text-amber-700' : 'text-emerald-700'}`}>
+                {pendingOfflineCount > 0 ? `${pendingOfflineCount} menunggu sinkronisasi` : 'Semua tersinkron'}
+              </span>
+            </div>
+            <div className="text-[11px] text-slate-500 flex items-center justify-between">
+              <span>Waktu Sinkronisasi Terakhir:</span>
+              <span className="font-semibold text-slate-700">
+                {lastSynced ? lastSynced.toLocaleString('id-ID') : 'Baru saja'}
+              </span>
+            </div>
           </div>
         </div>
 
         {/* Footer */}
-        <div className="bg-slate-50 px-5 sm:px-6 py-3.5 border-t border-slate-200 flex items-center justify-between gap-3">
-          <button
-            type="button"
-            disabled={isSyncing}
-            onClick={handleManualSync}
-            className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-50"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
-            <span>{isSyncing ? 'Menyinkronkan...' : 'Sinkronkan Ulang Sekarang'}</span>
-          </button>
+        <div className="bg-slate-50 px-5 sm:px-6 py-3.5 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={isSyncing}
+              onClick={handleManualSync}
+              className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-xs cursor-pointer disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
+              <span>{isSyncing ? 'Menyinkronkan...' : 'Sinkronkan Ulang Sekarang'}</span>
+            </button>
+
+            {onOpenAutoBackup && (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                  onOpenAutoBackup();
+                }}
+                className="px-3 py-2 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer"
+              >
+                <HardDrive className="w-3.5 h-3.5" />
+                <span>Cadangan 1 Jam</span>
+              </button>
+            )}
+          </div>
 
           <button
             type="button"
