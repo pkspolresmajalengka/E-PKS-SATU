@@ -22,9 +22,12 @@ import firebaseConfig from '../../firebase-applet-config.json';
 import {
   enqueueOfflineMutation,
   getOfflineQueue,
+  getPendingServerBackupMutations,
+  markMutationsBackedUpToServer,
   removeOfflineMutation,
   OfflineMutationType
 } from './offlineSyncQueue';
+import { pushServerBackupDelta } from './serverBackupClient';
 
 // Initialize Firebase App
 const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
@@ -50,6 +53,8 @@ try {
 
 export const db = dbInstance;
 export const auth = getAuth(app);
+export const FIREBASE_PRICING_URL = 'https://firebase.google.com/pricing#cloud-firestore';
+export const FIRESTORE_UPGRADE_CONSOLE_URL = `https://console.firebase.google.com/project/${firebaseConfig.projectId}/firestore/databases/${firebaseConfig.firestoreDatabaseId}/data?openUpgradeDialog=true`;
 
 // Error Handling Enums and Types
 export enum OperationType {
@@ -131,10 +136,17 @@ export function sanitizeForFirestore<T = any>(val: T): T {
 
 // Connection test
 export async function testConnection(): Promise<boolean> {
+  if (isCloudWriteQuotaExceeded()) {
+    return false;
+  }
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
     return true;
   } catch (error) {
+    if (isQuotaExceededError(error)) {
+      markCloudWriteQuotaExceeded();
+      return false;
+    }
     if (error instanceof Error && error.message.includes('the client is offline')) {
       console.warn('Firebase client is offline, using offline cache.');
     }
@@ -168,9 +180,17 @@ export function subscribeToParticipants(
   );
 }
 
+export type CloudConnectionStatus =
+  | 'connecting'
+  | 'connected'
+  | 'quota_paused'
+  | 'offline'
+  | 'error';
+
 export interface CloudWriteResult {
   success: boolean;
   queuedOffline?: boolean;
+  backedUpToServer?: boolean;
   error?: string;
   isNetworkError?: boolean;
   isQuotaError?: boolean;
@@ -179,13 +199,41 @@ export interface CloudWriteResult {
 export interface CloudWriteOptions {
   bypassQuotaGuard?: boolean;
   skipOfflineQueue?: boolean;
+  skipServerMirror?: boolean;
 }
 
 const CLOUD_WRITE_TIMEOUT_MS = 10000;
+const QUOTA_GUARD_STORAGE_KEY = 'pks_firestore_write_quota_day_v1';
 const QUOTA_EXCEEDED_USER_MSG =
-  'Kuota tulis harian Cloud Firestore telah tercapai. Kuota akan direset otomatis keesokan harinya. Perubahan tetap disimpan secara lokal di perangkat ini.';
+  'Kuota tulis harian Cloud Firestore tercapai. Perubahan tetap aman di Cadangan Server & perangkat ini, dan akan otomatis dikirim saat kuota direset besok.';
 
-let writeQuotaExceeded = false;
+function getCurrentUtcDayKey(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function readPersistedWriteQuotaExceeded(): boolean {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return false;
+    return window.localStorage.getItem(QUOTA_GUARD_STORAGE_KEY) === getCurrentUtcDayKey();
+  } catch {
+    return false;
+  }
+}
+
+function persistWriteQuotaExceeded(exceeded: boolean): void {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return;
+    if (exceeded) {
+      window.localStorage.setItem(QUOTA_GUARD_STORAGE_KEY, getCurrentUtcDayKey());
+    } else {
+      window.localStorage.removeItem(QUOTA_GUARD_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+let writeQuotaExceeded = readPersistedWriteQuotaExceeded();
 const quotaListeners = new Set<(exceeded: boolean) => void>();
 const pendingQuotaAbortRejectors = new Set<(err: Error) => void>();
 let quotaConsoleObserverInstalled = false;
@@ -215,6 +263,7 @@ export function subscribeToCloudQuota(listener: (exceeded: boolean) => void): ()
 }
 
 export function markCloudWriteQuotaExceeded(): void {
+  persistWriteQuotaExceeded(true);
   if (!writeQuotaExceeded) {
     writeQuotaExceeded = true;
     quotaListeners.forEach(cb => {
@@ -246,6 +295,7 @@ export function markCloudWriteQuotaExceeded(): void {
 
 export async function resetCloudWriteQuotaGuard(): Promise<void> {
   writeQuotaExceeded = false;
+  persistWriteQuotaExceeded(false);
   quotaListeners.forEach(cb => {
     try {
       cb(false);
@@ -264,38 +314,67 @@ function installFirestoreQuotaObserver(): void {
   if (quotaConsoleObserverInstalled || typeof console === 'undefined') return;
   quotaConsoleObserverInstalled = true;
 
-  const inspectArgs = (args: unknown[]) => {
+  const isFirestoreQuotaOrBackoffLog = (args: unknown[]): 'quota' | 'backoff' | null => {
     try {
-      if (!args || args.length === 0) return;
+      if (!args || args.length === 0) return null;
       const joined = args.map(a => (typeof a === 'string' ? a : String(a || ''))).join(' ');
       const lower = joined.toLowerCase();
+      if (!lower.includes('@firebase/firestore')) return null;
+
       if (
-        lower.includes('@firebase/firestore') &&
-        (lower.includes('quota limit exceeded') ||
-          lower.includes('free daily write units') ||
-          lower.includes('free daily read units'))
+        lower.includes('quota limit exceeded') ||
+        lower.includes('free daily write units') ||
+        lower.includes('free daily read units')
       ) {
-        markCloudWriteQuotaExceeded();
+        return 'quota';
       }
+      if (lower.includes('using maximum backoff delay')) {
+        return 'backoff';
+      }
+      return null;
     } catch {
-      // ignore
+      return null;
     }
   };
 
   const origError = console.error.bind(console);
+  const origWarn = console.warn.bind(console);
+
   console.error = (...args: unknown[]) => {
-    inspectArgs(args);
+    const kind = isFirestoreQuotaOrBackoffLog(args);
+    if (kind === 'quota') {
+      markCloudWriteQuotaExceeded();
+      origWarn('[Cloud Quota Guard] Batas kuota tulis harian Firestore tercapai. Beralih ke penyimpanan lokal otomatis hingga besok.');
+      return;
+    }
+    if (kind === 'backoff') {
+      if (writeQuotaExceeded) return;
+      origWarn(...args);
+      return;
+    }
     origError(...args);
   };
 
-  const origWarn = console.warn.bind(console);
   console.warn = (...args: unknown[]) => {
-    inspectArgs(args);
+    const kind = isFirestoreQuotaOrBackoffLog(args);
+    if (kind === 'quota') {
+      markCloudWriteQuotaExceeded();
+      return;
+    }
+    if (kind === 'backoff' && writeQuotaExceeded) {
+      return;
+    }
     origWarn(...args);
   };
 }
 
 installFirestoreQuotaObserver();
+
+// If daily write quota was already exhausted earlier today, immediately pause Firestore network
+// before IndexedDB persistent cache attempts to replay pending mutations on reload.
+if (writeQuotaExceeded) {
+  void disableNetwork(db).catch(() => undefined);
+}
 
 export function classifyCloudError(
   error: unknown
@@ -356,6 +435,30 @@ export function classifyCloudError(
   };
 }
 
+async function tryBackupDeltaToServer(offlineSpec?: {
+  type: OfflineMutationType;
+  entityId: string;
+  payload?: any;
+}): Promise<boolean> {
+  if (!offlineSpec) return false;
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return false;
+  const nowIso = new Date().toISOString();
+  const res = await pushServerBackupDelta([
+    {
+      type: offlineSpec.type,
+      entityId: offlineSpec.entityId,
+      payload: offlineSpec.payload,
+      updatedAt: nowIso
+    }
+  ]);
+  if (res?.success) {
+    const key = `${offlineSpec.type}:${String(offlineSpec.entityId || 'singleton')}`;
+    markMutationsBackedUpToServer([key], nowIso);
+    return true;
+  }
+  return false;
+}
+
 async function executeCloudMutation(
   operation: () => Promise<void>,
   operationType: OperationType,
@@ -383,11 +486,20 @@ async function executeCloudMutation(
   }
 
   if (writeQuotaExceeded && !options?.bypassQuotaGuard) {
+    if (offlineSpec && !options?.skipOfflineQueue) {
+      enqueueOfflineMutation(offlineSpec.type, offlineSpec.entityId, offlineSpec.payload);
+    }
+    const backedUpToServer = !options?.skipServerMirror
+      ? await tryBackupDeltaToServer(offlineSpec)
+      : false;
     return {
       success: false,
+      backedUpToServer,
       isNetworkError: false,
       isQuotaError: true,
-      error: QUOTA_EXCEEDED_USER_MSG
+      error: backedUpToServer
+        ? QUOTA_EXCEEDED_USER_MSG
+        : 'Kuota tulis harian Cloud Firestore tercapai. Perubahan disimpan lokal di perangkat ini hingga kuota direset.'
     };
   }
 
@@ -405,26 +517,44 @@ async function executeCloudMutation(
         }, CLOUD_WRITE_TIMEOUT_MS);
       })
     ]);
+    // Keep server-side delta backup silently in sync when online
+    if (offlineSpec && !options?.skipServerMirror) {
+      void tryBackupDeltaToServer(offlineSpec);
+    }
     return { success: true };
   } catch (error) {
+    let backedUpToServer = false;
     if (isQuotaExceededError(error)) {
       markCloudWriteQuotaExceeded();
+      if (offlineSpec && !options?.skipOfflineQueue) {
+        enqueueOfflineMutation(offlineSpec.type, offlineSpec.entityId, offlineSpec.payload);
+      }
+      if (!options?.skipServerMirror) {
+        backedUpToServer = await tryBackupDeltaToServer(offlineSpec);
+      }
     } else {
       handleFirestoreError(error, operationType, path);
     }
     const classified = classifyCloudError(error);
     if (classified.isNetworkError && offlineSpec && !options?.skipOfflineQueue) {
       enqueueOfflineMutation(offlineSpec.type, offlineSpec.entityId, offlineSpec.payload);
+      if (!options?.skipServerMirror) {
+        backedUpToServer = await tryBackupDeltaToServer(offlineSpec);
+      }
       return {
         success: false,
         queuedOffline: true,
-        error: 'Koneksi ke Cloud terputus. Perubahan disimpan lokal & akan otomatis tersinkron saat online.',
+        backedUpToServer,
+        error: backedUpToServer
+          ? 'Koneksi ke Cloud terputus. Perubahan diamankan di Cadangan Server & antrean lokal.'
+          : 'Koneksi ke Cloud terputus. Perubahan disimpan lokal & akan otomatis tersinkron saat online.',
         isNetworkError: true,
         isQuotaError: false
       };
     }
     return {
       success: false,
+      backedUpToServer,
       error: classified.message,
       isNetworkError: classified.isNetworkError,
       isQuotaError: classified.isQuotaError
@@ -805,12 +935,22 @@ export async function saveAppStatusToCloud(
 // 7. PAYMENT GATEWAY & REGISTRATION FEE CONFIGURATION
 export interface FormFeeConfig {
   fee: number;
+  mealFee?: number;
+  schoolFee?: number;
   isFree: boolean;
   description: string;
 }
 
+export interface PoljarSettings {
+  tahunAngkatan: string;
+  angkatan: string;
+  allowInstallment: boolean;
+  minDpPercent: number;
+}
+
 export interface PaymentConfig {
   id?: string;
+  poljarSettings?: PoljarSettings;
   formFees: {
     polisi_pelajar: FormFeeConfig;
     calon_pks: FormFeeConfig;
@@ -848,6 +988,12 @@ export interface PaymentConfig {
 
 export const DEFAULT_PAYMENT_CONFIG: PaymentConfig = {
   id: 'payment_config',
+  poljarSettings: {
+    tahunAngkatan: '2026',
+    angkatan: '01',
+    allowInstallment: true,
+    minDpPercent: 30
+  },
   formFees: {
     polisi_pelajar: {
       fee: 50000,
@@ -861,13 +1007,16 @@ export const DEFAULT_PAYMENT_CONFIG: PaymentConfig = {
     },
     kemah_balok1: {
       fee: 150000,
+      mealFee: 25000,
+      schoolFee: 100000,
       isFree: false,
-      description: 'Biaya perkemahan pelantikan tingkat Balok 1 (Tenda, konsumsi, atribut)'
+      description: 'Biaya wajib sekolah per pengajuan (Cash penuh) + biaya dasar peserta & konsumsi Balok 1'
     },
     pks_balok2: {
       fee: 75000,
+      mealFee: 25000,
       isFree: false,
-      description: 'Biaya ujian komprehensif kepangkatan Balok 2 & sertifikasi Satlantas'
+      description: 'Biaya dasar per peserta ujian/kemah Balok 2 + opsi konsumsi per peserta'
     }
   },
   midtrans: {
@@ -906,6 +1055,21 @@ export interface VerificationStage {
   registrationNumber?: string;
 }
 
+export interface InstallmentPaymentRecord {
+  id: string;
+  amount: number;
+  method: 'midtrans' | 'ratapay' | 'qris' | 'bank_transfer' | 'free';
+  date: string;
+  proofUrl?: string;
+  proofFileName?: string;
+  reference?: string;
+  status: 'pending_verification' | 'approved' | 'rejected';
+  verifiedBy?: string;
+  verifiedAt?: string;
+  note?: string;
+  isDp?: boolean;
+}
+
 export interface RegistrationSubmission {
   id: string;
   formType: 'polisi_pelajar' | 'calon_pks' | 'kemah_balok1' | 'pks_balok2';
@@ -918,7 +1082,17 @@ export interface RegistrationSubmission {
   formData: Record<string, any>;
   feeAmount: number;
   paymentMethod: 'midtrans' | 'ratapay' | 'qris' | 'bank_transfer' | 'free';
-  paymentStatus: 'unpaid' | 'pending_verification' | 'paid' | 'rejected';
+  paymentStatus: 'unpaid' | 'partial' | 'pending_verification' | 'paid' | 'rejected';
+  paymentPlan?: 'cash' | 'installment';
+  paidAmount?: number;
+  remainingAmount?: number;
+  minDpAmount?: number;
+  pendingPaymentAmount?: number;
+  installmentHistory?: InstallmentPaymentRecord[];
+  nomorIndukPoljar?: string;
+  nippStatus?: 'pending_payment' | 'active';
+  tahunAngkatan?: string;
+  angkatan?: string;
   paymentProofUrl?: string;
   paymentProofFileName?: string;
   paymentDate?: string;
@@ -928,6 +1102,49 @@ export interface RegistrationSubmission {
   stage2Committee: VerificationStage;
   createdAt: string;
   updatedAt: string;
+}
+
+export function normalizeAngkatanCode(angkatan?: string): string {
+  const cleaned = String(angkatan || '1').trim();
+  if (!cleaned) return '01';
+  const digits = cleaned.replace(/\D+/g, '');
+  if (digits && digits.length <= 2) {
+    return digits.padStart(2, '0');
+  }
+  return cleaned.toUpperCase();
+}
+
+export function formatBirthDateDDMMYYYY(tanggalLahir?: string): string {
+  const raw = String(tanggalLahir || '').trim();
+  if (!raw) return '';
+  const isoMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  if (isoMatch) {
+    return `${isoMatch[3]}${isoMatch[2]}${isoMatch[1]}`;
+  }
+  const dmyMatch = /^(\d{2})[-/](\d{2})[-/](\d{4})$/.exec(raw);
+  if (dmyMatch) {
+    return `${dmyMatch[1]}${dmyMatch[2]}${dmyMatch[3]}`;
+  }
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) {
+    const dd = String(parsed.getDate()).padStart(2, '0');
+    const mm = String(parsed.getMonth() + 1).padStart(2, '0');
+    const yyyy = String(parsed.getFullYear());
+    return `${dd}${mm}${yyyy}`;
+  }
+  return '';
+}
+
+export function generateNomorIndukPoljar(
+  tahunAngkatan?: string,
+  angkatan?: string,
+  tanggalLahir?: string
+): string {
+  const ddmmyyyy = formatBirthDateDDMMYYYY(tanggalLahir);
+  if (!ddmmyyyy) return '';
+  const year = String(tahunAngkatan || new Date().getFullYear()).trim() || '2026';
+  const ang = normalizeAngkatanCode(angkatan);
+  return `PP-${year}-${ang}-${ddmmyyyy}`;
 }
 
 export function subscribeToPaymentConfig(
@@ -942,11 +1159,27 @@ export function subscribeToPaymentConfig(
         const data = docSnap.data();
         onUpdate({
           id: 'payment_config',
+          poljarSettings: {
+            ...DEFAULT_PAYMENT_CONFIG.poljarSettings!,
+            ...(data.poljarSettings || {})
+          },
           formFees: {
-            polisi_pelajar: data.formFees?.polisi_pelajar || DEFAULT_PAYMENT_CONFIG.formFees.polisi_pelajar,
-            calon_pks: data.formFees?.calon_pks || DEFAULT_PAYMENT_CONFIG.formFees.calon_pks,
-            kemah_balok1: data.formFees?.kemah_balok1 || DEFAULT_PAYMENT_CONFIG.formFees.kemah_balok1,
-            pks_balok2: data.formFees?.pks_balok2 || DEFAULT_PAYMENT_CONFIG.formFees.pks_balok2
+            polisi_pelajar: {
+              ...DEFAULT_PAYMENT_CONFIG.formFees.polisi_pelajar,
+              ...(data.formFees?.polisi_pelajar || {})
+            },
+            calon_pks: {
+              ...DEFAULT_PAYMENT_CONFIG.formFees.calon_pks,
+              ...(data.formFees?.calon_pks || {})
+            },
+            kemah_balok1: {
+              ...DEFAULT_PAYMENT_CONFIG.formFees.kemah_balok1,
+              ...(data.formFees?.kemah_balok1 || {})
+            },
+            pks_balok2: {
+              ...DEFAULT_PAYMENT_CONFIG.formFees.pks_balok2,
+              ...(data.formFees?.pks_balok2 || {})
+            }
           },
           midtrans: {
             ...DEFAULT_PAYMENT_CONFIG.midtrans,
@@ -1158,6 +1391,367 @@ export async function saveBlankoConfigToCloud(
 }
 
 // ==========================================
+// 7B. LOMBA CERDAS CERMAT (SOAL ADMIN & JAWABAN SEKOLAH)
+// ==========================================
+
+export type CerdasCermatQuestionType = 'multiple_choice' | 'essay';
+export type CerdasCermatOptionKey = 'A' | 'B' | 'C' | 'D';
+export type CerdasCermatTargetLevel = 'ALL' | 'SLTP' | 'SLTA';
+
+export interface CerdasCermatQuestionOption {
+  key: CerdasCermatOptionKey;
+  text: string;
+}
+
+export interface CerdasCermatQuestion {
+  id: string;
+  number: number;
+  type: CerdasCermatQuestionType;
+  targetLevel: CerdasCermatTargetLevel;
+  prompt: string;
+  options: CerdasCermatQuestionOption[];
+  correctOption: CerdasCermatOptionKey;
+  maxPoints: number;
+  guideAnswer?: string;
+}
+
+export interface CerdasCermatConfig {
+  id?: string;
+  title: string;
+  description: string;
+  isOpen: boolean;
+  questions: CerdasCermatQuestion[];
+  updatedAt?: string;
+  updatedBy?: string;
+}
+
+export interface CerdasCermatAnswerItem {
+  selectedOption?: CerdasCermatOptionKey | '';
+  textAnswer?: string;
+}
+
+export interface CerdasCermatGradeItem {
+  score: number;
+  comment?: string;
+}
+
+export interface CerdasCermatSubmission {
+  id: string;
+  schoolUsername: string;
+  schoolName: string;
+  schoolLevel: 'SLTP' | 'SLTA';
+  submittedByName: string;
+  participantId?: string;
+  participantLabel?: string;
+  answers: Record<string, CerdasCermatAnswerItem>;
+  questionGrades: Record<string, CerdasCermatGradeItem>;
+  autoMcScore: number;
+  essayScore: number;
+  totalScore: number;
+  maxPossibleScore: number;
+  status: 'submitted' | 'graded';
+  adminNote?: string;
+  gradedBy?: string;
+  gradedAt?: string;
+  submittedAt: string;
+  updatedAt: string;
+}
+
+export const DEFAULT_CERDAS_CERMAT_CONFIG: CerdasCermatConfig = {
+  id: 'cerdas_cermat_config',
+  title: 'Lomba Cerdas Cermat Patroli Keamanan Sekolah (PKS) 2026',
+  description:
+    'Bacalah setiap soal dengan cermat. Jawab seluruh butir Pilihan Ganda maupun Isian/Esai sebelum menekan Kirim Jawaban Final. Setiap akun sekolah hanya dapat mengirimkan jawaban satu kali.',
+  isOpen: true,
+  questions: [
+    {
+      id: 'cc-q-1',
+      number: 1,
+      type: 'multiple_choice',
+      targetLevel: 'ALL',
+      prompt: 'Apa tugas utama Patroli Keamanan Sekolah (PKS) di lingkungan sekolah?',
+      options: [
+        { key: 'A', text: 'Membantu menjaga ketertiban lalu lintas dan keamanan di sekitar lingkungan sekolah' },
+        { key: 'B', text: 'Menggantikan fungsi seluruh aparat kepolisian di jalan raya umum' },
+        { key: 'C', text: 'Menjatuhkan sanksi tilang hukum kepada pengendara umum' },
+        { key: 'D', text: 'Mengatur administrasi keuangan tata usaha sekolah' }
+      ],
+      correctOption: 'A',
+      maxPoints: 15,
+      guideAnswer: ''
+    },
+    {
+      id: 'cc-q-2',
+      number: 2,
+      type: 'multiple_choice',
+      targetLevel: 'ALL',
+      prompt: 'Dalam 12 gerakan dasar pengaturan lalu lintas oleh petugas PKS, isyarat satu tangan diangkat tegak lurus ke atas berarti:',
+      options: [
+        { key: 'A', text: 'Mempercepat laju kendaraan dari segala arah' },
+        { key: 'B', text: 'Menghentikan semua arah arus lalu lintas (Stop Semua Jurusan)' },
+        { key: 'C', text: 'Mempersilakan kendaraan belok kiri langsung' },
+        { key: 'D', text: 'Memberikan jalan khusus untuk kendaraan mundur' }
+      ],
+      correctOption: 'B',
+      maxPoints: 15,
+      guideAnswer: ''
+    },
+    {
+      id: 'cc-q-3',
+      number: 3,
+      type: 'multiple_choice',
+      targetLevel: 'ALL',
+      prompt: 'Undang-Undang Republik Indonesia yang mengatur tentang Lalu Lintas dan Angkutan Jalan saat ini adalah:',
+      options: [
+        { key: 'A', text: 'UU No. 20 Tahun 2003' },
+        { key: 'B', text: 'UU No. 22 Tahun 2009' },
+        { key: 'C', text: 'UU No. 35 Tahun 2009' },
+        { key: 'D', text: 'UU No. 2 Tahun 2002' }
+      ],
+      correctOption: 'B',
+      maxPoints: 20,
+      guideAnswer: ''
+    },
+    {
+      id: 'cc-q-4',
+      number: 4,
+      type: 'essay',
+      targetLevel: 'ALL',
+      prompt: 'Jelaskan secara singkat 3 sikap dasar dan etika anggota PKS saat membantu menyeberangkan siswa di depan gerbang sekolah!',
+      options: [],
+      correctOption: 'A',
+      maxPoints: 25,
+      guideAnswer: 'Bersikap tegas namun sopan, mengutamakan keselamatan diri dan penyeberang (pastikan arus berhenti sempurna), menggunakan perlengkapan standar (rompi/peluit/tanda stop) serta berkoordinasi dengan pembina/petugas.'
+    },
+    {
+      id: 'cc-q-5',
+      number: 5,
+      type: 'essay',
+      targetLevel: 'ALL',
+      prompt: 'Sebutkan dan jelaskan perbedaan fungsi rambu lalu lintas berwarna dasar kuning dan berwarna dasar biru!',
+      options: [],
+      correctOption: 'A',
+      maxPoints: 25,
+      guideAnswer: 'Rambu dasar kuning berisi peringatan bahaya/kondisi jalan agar pengguna waspada; rambu dasar biru berisi perintah wajib yang harus dipatuhi pengguna jalan.'
+    }
+  ]
+};
+
+const CERDAS_CERMAT_CONFIG_CACHE_KEY = 'PBB_PKS_CERDAS_CERMAT_CONFIG_V1';
+const CERDAS_CERMAT_SUBMISSIONS_CACHE_KEY = 'PBB_PKS_CERDAS_CERMAT_SUBS_V1';
+const cerdasCermatSubmissionsOverlayListeners = new Set<() => void>();
+
+export function getCachedCerdasCermatConfigFromLocal(): CerdasCermatConfig {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const raw = window.localStorage.getItem(CERDAS_CERMAT_CONFIG_CACHE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && Array.isArray(parsed.questions)) {
+          return {
+            ...DEFAULT_CERDAS_CERMAT_CONFIG,
+            ...parsed,
+            questions: parsed.questions
+          };
+        }
+      }
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return DEFAULT_CERDAS_CERMAT_CONFIG;
+}
+
+export function cacheCerdasCermatConfigToLocal(cfg: CerdasCermatConfig): void {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.setItem(CERDAS_CERMAT_CONFIG_CACHE_KEY, JSON.stringify(cfg));
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function subscribeToCerdasCermatConfig(
+  onUpdate: (config: CerdasCermatConfig) => void,
+  onError?: (err: any) => void
+) {
+  const path = 'settings/cerdas_cermat_config';
+  return onSnapshot(
+    doc(db, 'settings', 'cerdas_cermat_config'),
+    docSnap => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        const normalized: CerdasCermatConfig = {
+          id: 'cerdas_cermat_config',
+          title: typeof data.title === 'string' && data.title.trim() ? data.title : DEFAULT_CERDAS_CERMAT_CONFIG.title,
+          description: typeof data.description === 'string' ? data.description : DEFAULT_CERDAS_CERMAT_CONFIG.description,
+          isOpen: typeof data.isOpen === 'boolean' ? data.isOpen : true,
+          questions: Array.isArray(data.questions) ? data.questions : DEFAULT_CERDAS_CERMAT_CONFIG.questions,
+          updatedAt: data.updatedAt || '',
+          updatedBy: data.updatedBy || ''
+        };
+        cacheCerdasCermatConfigToLocal(normalized);
+        onUpdate(normalized);
+      } else {
+        onUpdate(getCachedCerdasCermatConfigFromLocal());
+      }
+    },
+    error => {
+      handleFirestoreError(error, OperationType.GET, path);
+      if (onError) onError(error);
+    }
+  );
+}
+
+export async function saveCerdasCermatConfigToCloud(
+  config: CerdasCermatConfig,
+  options?: CloudWriteOptions
+): Promise<CloudWriteResult> {
+  const path = 'settings/cerdas_cermat_config';
+  const cleanDoc = sanitizeForFirestore({
+    ...config,
+    id: 'cerdas_cermat_config',
+    updatedAt: new Date().toISOString()
+  });
+  cacheCerdasCermatConfigToLocal(cleanDoc);
+  return executeCloudMutation(
+    () => setDoc(doc(db, 'settings', 'cerdas_cermat_config'), cleanDoc),
+    OperationType.WRITE,
+    path,
+    options,
+    { type: 'cerdas_cermat_config_save', entityId: 'cerdas_cermat_config', payload: cleanDoc }
+  );
+}
+
+export function getCachedCerdasCermatSubmissionsFromLocal(): CerdasCermatSubmission[] {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return [];
+    const raw = window.localStorage.getItem(CERDAS_CERMAT_SUBMISSIONS_CACHE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+export function cacheCerdasCermatSubmissionsToLocal(items: CerdasCermatSubmission[]): void {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.setItem(CERDAS_CERMAT_SUBMISSIONS_CACHE_KEY, JSON.stringify(items));
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function applyOfflineCerdasCermatOverlay(baseItems: CerdasCermatSubmission[]): CerdasCermatSubmission[] {
+  const queue = getOfflineQueue();
+  let merged = [...baseItems];
+  for (const item of queue) {
+    if (item.type === 'cerdas_cermat_submission_save' && item.payload) {
+      const idx = merged.findIndex(r => r.id === item.entityId);
+      if (idx >= 0) {
+        merged[idx] = item.payload;
+      } else {
+        merged = [item.payload, ...merged];
+      }
+    } else if (item.type === 'cerdas_cermat_submission_delete') {
+      merged = merged.filter(r => r.id !== item.entityId);
+    }
+  }
+  return merged;
+}
+
+export function subscribeToCerdasCermatSubmissions(
+  onUpdate: (submissions: CerdasCermatSubmission[]) => void,
+  onError?: (err: any) => void
+) {
+  const path = 'cerdas_cermat_submissions';
+  let latestServerOrCache = getCachedCerdasCermatSubmissionsFromLocal();
+
+  const emitMerged = (base: CerdasCermatSubmission[]) => {
+    const merged = applyOfflineCerdasCerdasSafe(base);
+    cacheCerdasCermatSubmissionsToLocal(merged);
+    onUpdate(merged);
+  };
+
+  function applyOfflineCerdasCerdasSafe(base: CerdasCermatSubmission[]): CerdasCermatSubmission[] {
+    return applyOfflineCerdasCermatOverlay(base);
+  }
+
+  const localOverlayHandler = () => {
+    emitMerged(latestServerOrCache);
+  };
+  cerdasCermatSubmissionsOverlayListeners.add(localOverlayHandler);
+
+  const unsubFirestore = onSnapshot(
+    collection(db, path),
+    snapshot => {
+      const items: CerdasCermatSubmission[] = [];
+      snapshot.forEach(docSnap => {
+        items.push(docSnap.data() as CerdasCermatSubmission);
+      });
+      latestServerOrCache = items;
+      emitMerged(items);
+    },
+    error => {
+      handleFirestoreError(error, OperationType.LIST, path);
+      if (onError) onError(error);
+    }
+  );
+
+  return () => {
+    cerdasCermatSubmissionsOverlayListeners.delete(localOverlayHandler);
+    unsubFirestore();
+  };
+}
+
+export async function saveCerdasCermatSubmissionToCloud(
+  submission: CerdasCermatSubmission,
+  options?: CloudWriteOptions
+): Promise<CloudWriteResult> {
+  if (!submission || !submission.id) {
+    return { success: false, error: 'ID kiriman Cerdas Cermat tidak valid' };
+  }
+  const path = `cerdas_cermat_submissions/${submission.id}`;
+  const cleanDoc = sanitizeForFirestore({
+    ...submission,
+    updatedAt: new Date().toISOString()
+  });
+  const res = await executeCloudMutation(
+    () => setDoc(doc(db, 'cerdas_cermat_submissions', submission.id), cleanDoc),
+    OperationType.WRITE,
+    path,
+    options,
+    { type: 'cerdas_cermat_submission_save', entityId: submission.id, payload: cleanDoc }
+  );
+  if (res.queuedOffline || res.isQuotaError) {
+    cerdasCermatSubmissionsOverlayListeners.forEach(cb => cb());
+  }
+  return res;
+}
+
+export async function deleteCerdasCermatSubmissionFromCloud(
+  submissionId: string,
+  options?: CloudWriteOptions
+): Promise<CloudWriteResult> {
+  const path = `cerdas_cermat_submissions/${submissionId}`;
+  const res = await executeCloudMutation(
+    () => deleteDoc(doc(db, 'cerdas_cermat_submissions', submissionId)),
+    OperationType.DELETE,
+    path,
+    options,
+    { type: 'cerdas_cermat_submission_delete', entityId: submissionId }
+  );
+  if (res.queuedOffline || res.isQuotaError) {
+    cerdasCermatSubmissionsOverlayListeners.forEach(cb => cb());
+  }
+  return res;
+}
+
+// ==========================================
 // 8. LEGACY ACTIVITY LOGS CLEANUP (QUOTA SAVER)
 // ==========================================
 
@@ -1191,7 +1785,11 @@ export async function purgeLegacyActivityLogsFromCloudAndLocal(): Promise<void> 
   }
 
   try {
-    await deleteDoc(doc(db, 'settings', LEGACY_ACTIVITY_LOGS_DOC_ID));
+    const legacyRef = doc(db, 'settings', LEGACY_ACTIVITY_LOGS_DOC_ID);
+    const legacySnap = await getDoc(legacyRef);
+    if (legacySnap.exists() && !isCloudWriteQuotaExceeded()) {
+      await deleteDoc(legacyRef);
+    }
 
     let batchRounds = 0;
     let hasMoreLegacyDocs = false;
@@ -1227,14 +1825,42 @@ export async function purgeLegacyActivityLogsFromCloudAndLocal(): Promise<void> 
 }
 
 // ==========================================
-// 9. OFFLINE QUEUE AUTO-FLUSH MANAGER
+// 9. DELTA OFFLINE QUEUE & SERVER BACKUP FLUSH MANAGER
 // ==========================================
 
 export interface OfflineFlushSummary {
   flushedCount: number;
   remainingCount: number;
+  serverBackedUpCount: number;
   hadQuotaError: boolean;
   hadNetworkError: boolean;
+  lastErrorMessage?: string;
+}
+
+export async function syncPendingDeltasToServerBackup(): Promise<number> {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return 0;
+  }
+  const pending = getPendingServerBackupMutations();
+  if (pending.length === 0) return 0;
+
+  const res = await pushServerBackupDelta(
+    pending.map(item => ({
+      key: item.key,
+      type: item.type,
+      entityId: item.entityId,
+      payload: item.payload,
+      updatedAt: item.updatedAt
+    }))
+  );
+  if (res?.success) {
+    markMutationsBackedUpToServer(
+      pending.map(i => i.key),
+      res.updatedAt || new Date().toISOString()
+    );
+    return pending.length;
+  }
+  return 0;
 }
 
 let activeFlushPromise: Promise<OfflineFlushSummary> | null = null;
@@ -1243,15 +1869,23 @@ export async function flushOfflineSyncQueue(): Promise<OfflineFlushSummary> {
   if (activeFlushPromise) return activeFlushPromise;
 
   activeFlushPromise = (async () => {
+    const serverBackedUpCount = await syncPendingDeltasToServerBackup();
     const queue = getOfflineQueue();
     if (queue.length === 0) {
-      return { flushedCount: 0, remainingCount: 0, hadQuotaError: false, hadNetworkError: false };
+      return {
+        flushedCount: 0,
+        remainingCount: 0,
+        serverBackedUpCount,
+        hadQuotaError: false,
+        hadNetworkError: false
+      };
     }
 
     if ((typeof navigator !== 'undefined' && !navigator.onLine) || isCloudWriteQuotaExceeded()) {
       return {
         flushedCount: 0,
         remainingCount: queue.length,
+        serverBackedUpCount,
         hadQuotaError: isCloudWriteQuotaExceeded(),
         hadNetworkError: typeof navigator !== 'undefined' ? !navigator.onLine : false
       };
@@ -1260,10 +1894,11 @@ export async function flushOfflineSyncQueue(): Promise<OfflineFlushSummary> {
     let flushedCount = 0;
     let hadQuotaError = false;
     let hadNetworkError = false;
+    let lastErrorMessage: string | undefined;
 
     for (const item of queue) {
       let res: CloudWriteResult = { success: true };
-      const opts: CloudWriteOptions = { skipOfflineQueue: true };
+      const opts: CloudWriteOptions = { skipOfflineQueue: true, skipServerMirror: true };
 
       switch (item.type) {
         case 'participant_save':
@@ -1299,6 +1934,15 @@ export async function flushOfflineSyncQueue(): Promise<OfflineFlushSummary> {
         case 'registration_delete':
           res = await deleteRegistrationFromCloud(item.entityId, opts);
           break;
+        case 'cerdas_cermat_config_save':
+          res = await saveCerdasCermatConfigToCloud(item.payload, opts);
+          break;
+        case 'cerdas_cermat_submission_save':
+          res = await saveCerdasCermatSubmissionToCloud(item.payload, opts);
+          break;
+        case 'cerdas_cermat_submission_delete':
+          res = await deleteCerdasCermatSubmissionFromCloud(item.entityId, opts);
+          break;
       }
 
       if (res.success) {
@@ -1306,12 +1950,15 @@ export async function flushOfflineSyncQueue(): Promise<OfflineFlushSummary> {
         flushedCount += 1;
       } else if (res.isQuotaError) {
         hadQuotaError = true;
+        lastErrorMessage = res.error;
         break;
       } else if (res.isNetworkError) {
         hadNetworkError = true;
+        lastErrorMessage = res.error;
         break;
       } else {
-        // Non-retryable payload/permission error: drop from queue so it doesn't block subsequent items
+        // Non-retryable payload/permission error: keep copy on server backup and drop blocking Firestore item
+        lastErrorMessage = res.error;
         removeOfflineMutation(item.key);
       }
     }
@@ -1319,8 +1966,10 @@ export async function flushOfflineSyncQueue(): Promise<OfflineFlushSummary> {
     return {
       flushedCount,
       remainingCount: getOfflineQueue().length,
+      serverBackedUpCount,
       hadQuotaError,
-      hadNetworkError
+      hadNetworkError,
+      lastErrorMessage
     };
   })();
 

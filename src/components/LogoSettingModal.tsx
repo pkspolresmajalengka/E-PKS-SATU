@@ -96,7 +96,7 @@ export const LogoSettingModal: React.FC<LogoSettingModalProps> = ({
     setNetworkError(null);
     try {
       const res = previewLogo ? await onSaveLogo(previewLogo) : await onResetLogo();
-      if (res && !res.success) {
+      if (res && !res.success && !res.queuedOffline && !res.isQuotaError) {
         setNetworkError({
           title: 'Gagal Menyimpan Logo ke Cloud',
           message: res.error || 'Terjadi gangguan jaringan saat menyimpan logo aplikasi.',
@@ -116,7 +116,7 @@ export const LogoSettingModal: React.FC<LogoSettingModalProps> = ({
     setNetworkError(null);
     try {
       const res = await onResetLogo();
-      if (res && !res.success) {
+      if (res && !res.success && !res.queuedOffline && !res.isQuotaError) {
         setNetworkError({
           title: 'Gagal Mereset Logo di Cloud',
           message: res.error || 'Terjadi gangguan jaringan saat mereset logo.',

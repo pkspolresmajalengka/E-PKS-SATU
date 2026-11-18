@@ -69,23 +69,42 @@ import {
   WifiOff,
   ExternalLink,
   HardDrive,
-  Save
+  Save,
+  BookOpen
 } from 'lucide-react';
 import { RegistrationFormsView } from './components/RegistrationFormsView';
 import { RegistrationSubmissionsAdminView } from './components/RegistrationSubmissionsAdminView';
 import { MembersDirectoryView } from './components/MembersDirectoryView';
+import { SchoolPksMembersDashboardSection } from './components/SchoolPksMembersDashboardSection';
+import { AdminPksCategoryChart } from './components/AdminPksCategoryChart';
+import { SchoolProfileView, computeSchoolProfileCompleteness } from './components/SchoolProfileView';
+import { CerdasCermatView } from './components/CerdasCermatView';
 import { PaymentGatewaySettingsModal } from './components/PaymentGatewaySettingsModal';
 import { BlankoEditorModal } from './components/BlankoEditorModal';
 import { LogoSettingModal } from './components/LogoSettingModal';
 import { SchoolAccountManagerModal } from './components/SchoolAccountManagerModal';
-import { CloudSyncModal } from './components/CloudSyncModal';
+import { CloudSyncModal, DeltaSyncActionResult } from './components/CloudSyncModal';
 import { AutoBackupModal } from './components/AutoBackupModal';
 import { AppStatusModal } from './components/AppStatusModal';
 import { AppMaintenanceView } from './components/AppMaintenanceView';
 import { NetworkErrorBanner, NetworkErrorState } from './components/NetworkErrorBanner';
 import { PWAInstallButton, OfflineConnectivityBar } from './components/PWAInstallControl';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
-import { subscribeToOfflineQueue, getOfflineQueueCount } from './lib/offlineSyncQueue';
+import {
+  subscribeToOfflineQueue,
+  getOfflineQueueCount,
+  getOfflineQueueStats,
+  enqueueOfflineMutation,
+  removeOfflineMutation
+} from './lib/offlineSyncQueue';
+import {
+  ServerBackupStatus,
+  getLatestServerBackupStatus,
+  subscribeToServerBackupStatus,
+  fetchServerBackupStatus,
+  fetchServerBackupState,
+  pushServerBackupSnapshot
+} from './lib/serverBackupClient';
 import {
   AUTO_BACKUP_INTERVAL_MS,
   AutoBackupSettings,
@@ -106,6 +125,7 @@ import {
 import { compressImageFile } from './lib/imageUtils';
 import {
   testConnection,
+  CloudConnectionStatus,
   CloudWriteResult,
   subscribeToParticipants,
   saveParticipantToCloud,
@@ -126,18 +146,33 @@ import {
   saveRegistrationToCloud,
   getCachedRegistrationsFromLocal,
   flushOfflineSyncQueue,
+  syncPendingDeltasToServerBackup,
   PaymentConfig,
   DEFAULT_PAYMENT_CONFIG,
   RegistrationSubmission,
+  generateNomorIndukPoljar,
+  normalizeAngkatanCode,
   subscribeToBlankoConfig,
   saveBlankoConfigToCloud,
   BlankoConfig,
   DEFAULT_BLANKO_CONFIG,
+  subscribeToCerdasCermatConfig,
+  saveCerdasCermatConfigToCloud,
+  getCachedCerdasCermatConfigFromLocal,
+  subscribeToCerdasCermatSubmissions,
+  saveCerdasCermatSubmissionToCloud,
+  deleteCerdasCermatSubmissionFromCloud,
+  getCachedCerdasCermatSubmissionsFromLocal,
+  CerdasCermatConfig,
+  CerdasCermatSubmission,
+  DEFAULT_CERDAS_CERMAT_CONFIG,
   isCloudWriteQuotaExceeded,
+  isQuotaExceededError,
   subscribeToCloudQuota,
   resetCloudWriteQuotaGuard,
   clearLegacyLocalActivityLogs,
-  purgeLegacyActivityLogsFromCloudAndLocal
+  FIREBASE_PRICING_URL,
+  FIRESTORE_UPGRADE_CONSOLE_URL
 } from './lib/firebase';
 
 // ==========================================
@@ -146,6 +181,22 @@ import {
 
 export type UserRole = 'superadmin' | 'admin' | 'juri' | 'user' | 'sekolah' | 'pembina_polres';
 export type SchoolLevel = 'SLTP' | 'SLTA';
+
+export interface SchoolProfileData {
+  npsn?: string;
+  statusSekolah?: 'Negeri' | 'Swasta';
+  alamat?: string;
+  kecamatan?: string;
+  kabupaten?: string;
+  kodePos?: string;
+  kepalaSekolah?: string;
+  nipKepalaSekolah?: string;
+  emailSekolah?: string;
+  teleponSekolah?: string;
+  mottoPks?: string;
+  logoUrl?: string;
+  updatedAt?: string;
+}
 
 export interface AppUser {
   username: string;
@@ -157,6 +208,7 @@ export interface AppUser {
   schoolLevel?: SchoolLevel;
   pembinaName?: string;
   contactWa?: string;
+  schoolProfile?: SchoolProfileData;
 }
 
 export interface CalonPksStudentItem {
@@ -165,6 +217,16 @@ export interface CalonPksStudentItem {
   tempatLahir: string;
   tanggalLahir: string;
   jk: 'Laki-laki' | 'Perempuan' | '';
+}
+
+export interface CampBalokFormData {
+  sekolah: string;
+  jenjang: SchoolLevel;
+  maleCount: number;
+  femaleCount: number;
+  maleNames: string[];
+  femaleNames: string[];
+  mealCount: number;
 }
 
 export interface Criterion {
@@ -183,7 +245,8 @@ export type CategoryKey =
   | 'yelyel'
   | 'beladiri'
   | 'speaking'
-  | 'tenda';
+  | 'tenda'
+  | 'cerdas_cermat';
 
 export interface CategoryConfig {
   key: CategoryKey;
@@ -207,6 +270,7 @@ export interface ParticipantScores {
   beladiri: Record<number, number>;
   speaking: Record<number, number>;
   tenda: Record<number, number>;
+  cerdas_cermat?: Record<number, number>;
 }
 
 export interface FormPhotoData {
@@ -395,7 +459,12 @@ const TENDA_CRITERIA: Criterion[] = [
   { no: 6, name: "Kelengkapan Peralatan Wajib", weights: [2, 4, 6, 8, 10] }
 ];
 
-// KONFIGURASI DEFAULT KATEGORI (9 KATEGORI TERPADU)
+// 12. LOMBA CERDAS CERMAT (OTOMATIS DARI JAWABAN SEKOLAH & PENILAIAN ADMIN)
+const CERDAS_CERMAT_CRITERIA: Criterion[] = [
+  { no: 1, name: "Skor Akhir Lomba Cerdas Cermat", weights: [20, 40, 60, 80, 100] }
+];
+
+// KONFIGURASI DEFAULT KATEGORI (TERPADU + CERDAS CERMAT)
 const DEFAULT_CATEGORIES: CategoryConfig[] = [
   {
     key: 'pbb',
@@ -477,6 +546,15 @@ const DEFAULT_CATEGORIES: CategoryConfig[] = [
     maxPoints: 60,
     isMandatory: true,
     criteria: TENDA_CRITERIA
+  },
+  {
+    key: 'cerdas_cermat',
+    title: 'Lomba Cerdas Cermat',
+    shortTitle: 'Cerdas Cermat',
+    group: 'Kreasi & Khusus',
+    maxPoints: 100,
+    isMandatory: false,
+    criteria: CERDAS_CERMAT_CRITERIA
   }
 ];
 
@@ -532,7 +610,8 @@ const INITIAL_PESERTA: Participant[] = [
       yelyel: { 1:25, 2:25, 3:20, 4:25 },
       beladiri: { 1:10, 2:8, 3:10, 4:10, 5:10, 6:8, 7:10, 8:8 },
       speaking: { 1:25, 2:20, 3:25, 4:20, 5:25 },
-      tenda: { 1:10, 2:10, 3:8, 4:10, 5:10, 6:10 }
+      tenda: { 1:10, 2:10, 3:8, 4:10, 5:10, 6:10 },
+      cerdas_cermat: {}
     }
   },
   {
@@ -556,7 +635,8 @@ const INITIAL_PESERTA: Participant[] = [
       yelyel: { 1:20, 2:20, 3:20, 4:20 },
       beladiri: { 1:8, 2:8, 3:8, 4:8, 5:8, 6:8, 7:8, 8:8 },
       speaking: { 1:20, 2:20, 3:20, 4:20, 5:20 },
-      tenda: { 1:8, 2:8, 3:8, 4:8, 5:8, 6:8 }
+      tenda: { 1:8, 2:8, 3:8, 4:8, 5:8, 6:8 },
+      cerdas_cermat: {}
     }
   }
 ];
@@ -629,7 +709,8 @@ export function normalizeParticipantScores(p: Participant): { participant: Parti
     yelyel: rawScores.yelyel || {},
     beladiri: rawScores.beladiri || {},
     speaking: rawScores.speaking || {},
-    tenda: rawScores.tenda || {}
+    tenda: rawScores.tenda || {},
+    cerdas_cermat: rawScores.cerdas_cermat || {}
   };
 
   let cleanedPhotos = p.formPhotos;
@@ -683,7 +764,9 @@ export function normalizeCategoriesConfig(rawCats: any[]): { categories: Categor
         (oldDevile.criteria.length === 5 && oldDevile.maxPoints === 60))
   );
 
-  if (!needsMerge && !needsDevileFix) {
+  const hasCerdasCermat = rawCats.some((c: any) => c?.key === 'cerdas_cermat');
+
+  if (!needsMerge && !needsDevileFix && hasCerdasCermat) {
     return { categories: rawCats as CategoryConfig[], migrated: false };
   }
 
@@ -712,7 +795,7 @@ export function normalizeCategoriesConfig(rawCats: any[]): { categories: Categor
 
     nextCategories = [mergedPbb, ...filteredOthers];
   } else {
-    nextCategories = rawCats as CategoryConfig[];
+    nextCategories = [...(rawCats as CategoryConfig[])];
   }
 
   if (needsDevileFix) {
@@ -727,6 +810,13 @@ export function normalizeCategoriesConfig(rawCats: any[]): { categories: Categor
         criteria: filteredCriteria.length > 0 ? filteredCriteria : DEVILE_CRITERIA
       };
     });
+  }
+
+  if (!hasCerdasCermat) {
+    const defaultCC = DEFAULT_CATEGORIES.find(c => c.key === 'cerdas_cermat');
+    if (defaultCC) {
+      nextCategories = [...nextCategories, defaultCC];
+    }
   }
 
   return {
@@ -1068,7 +1158,16 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
-  const readSavedSidebarDropdowns = (): { cat: boolean; peserta: boolean; rekap: boolean; form: boolean } => {
+  const readSavedSidebarDropdowns = (): {
+    cat: boolean;
+    peserta: boolean;
+    rekap: boolean;
+    form: boolean;
+    pendaftaran: boolean;
+    lomba: boolean;
+    akun: boolean;
+    sistem: boolean;
+  } => {
     try {
       const raw = localStorage.getItem(SIDEBAR_DROPDOWNS_STORAGE_KEY);
       if (raw) {
@@ -1078,18 +1177,35 @@ export default function App() {
           peserta: Boolean(parsed?.peserta),
           rekap: Boolean(parsed?.rekap),
           form: Boolean(parsed?.form),
+          pendaftaran: Boolean(parsed?.pendaftaran),
+          lomba: Boolean(parsed?.lomba),
+          akun: Boolean(parsed?.akun),
+          sistem: Boolean(parsed?.sistem),
         };
       }
     } catch {
       // fallback
     }
-    return { cat: false, peserta: false, rekap: false, form: false };
+    return {
+      cat: false,
+      peserta: false,
+      rekap: false,
+      form: false,
+      pendaftaran: false,
+      lomba: false,
+      akun: false,
+      sistem: false,
+    };
   };
 
   const [sidebarCatDropdownOpen, setSidebarCatDropdownOpen] = useState<boolean>(() => readSavedSidebarDropdowns().cat);
   const [sidebarPesertaDropdownOpen, setSidebarPesertaDropdownOpen] = useState<boolean>(() => readSavedSidebarDropdowns().peserta);
   const [sidebarRekapDropdownOpen, setSidebarRekapDropdownOpen] = useState<boolean>(() => readSavedSidebarDropdowns().rekap);
   const [sidebarFormDropdownOpen, setSidebarFormDropdownOpen] = useState<boolean>(() => readSavedSidebarDropdowns().form);
+  const [sidebarPendaftaranDropdownOpen, setSidebarPendaftaranDropdownOpen] = useState<boolean>(() => readSavedSidebarDropdowns().pendaftaran);
+  const [sidebarLombaDropdownOpen, setSidebarLombaDropdownOpen] = useState<boolean>(() => readSavedSidebarDropdowns().lomba);
+  const [sidebarAkunDropdownOpen, setSidebarAkunDropdownOpen] = useState<boolean>(() => readSavedSidebarDropdowns().akun);
+  const [sidebarSistemDropdownOpen, setSidebarSistemDropdownOpen] = useState<boolean>(() => readSavedSidebarDropdowns().sistem);
   const [sidebarPesertaSearch, setSidebarPesertaSearch] = useState('');
   const [sidebarPesertaJenjang, setSidebarPesertaJenjang] = useState<'all' | 'SLTP' | 'SLTA'>('all');
 
@@ -1102,21 +1218,40 @@ export default function App() {
           peserta: sidebarPesertaDropdownOpen,
           rekap: sidebarRekapDropdownOpen,
           form: sidebarFormDropdownOpen,
+          pendaftaran: sidebarPendaftaranDropdownOpen,
+          lomba: sidebarLombaDropdownOpen,
+          akun: sidebarAkunDropdownOpen,
+          sistem: sidebarSistemDropdownOpen,
         })
       );
     } catch {
       // ignore storage errors
     }
-  }, [sidebarCatDropdownOpen, sidebarPesertaDropdownOpen, sidebarRekapDropdownOpen, sidebarFormDropdownOpen]);
+  }, [
+    sidebarCatDropdownOpen,
+    sidebarPesertaDropdownOpen,
+    sidebarRekapDropdownOpen,
+    sidebarFormDropdownOpen,
+    sidebarPendaftaranDropdownOpen,
+    sidebarLombaDropdownOpen,
+    sidebarAkunDropdownOpen,
+    sidebarSistemDropdownOpen,
+  ]);
 
   // Toggle individual dropdown independently without closing others; auto-expand collapsed sidebar
-  const toggleSidebarDropdown = (menu: 'cat' | 'peserta' | 'rekap' | 'form') => {
+  const toggleSidebarDropdown = (
+    menu: 'cat' | 'peserta' | 'rekap' | 'form' | 'pendaftaran' | 'lomba' | 'akun' | 'sistem'
+  ) => {
     if (sidebarCollapsed) {
       setSidebarCollapsed(false);
       if (menu === 'cat') setSidebarCatDropdownOpen(true);
       else if (menu === 'peserta') setSidebarPesertaDropdownOpen(true);
       else if (menu === 'rekap') setSidebarRekapDropdownOpen(true);
       else if (menu === 'form') setSidebarFormDropdownOpen(true);
+      else if (menu === 'pendaftaran') setSidebarPendaftaranDropdownOpen(true);
+      else if (menu === 'lomba') setSidebarLombaDropdownOpen(true);
+      else if (menu === 'akun') setSidebarAkunDropdownOpen(true);
+      else if (menu === 'sistem') setSidebarSistemDropdownOpen(true);
       return;
     }
 
@@ -1124,6 +1259,10 @@ export default function App() {
     else if (menu === 'peserta') setSidebarPesertaDropdownOpen(prev => !prev);
     else if (menu === 'rekap') setSidebarRekapDropdownOpen(prev => !prev);
     else if (menu === 'form') setSidebarFormDropdownOpen(prev => !prev);
+    else if (menu === 'pendaftaran') setSidebarPendaftaranDropdownOpen(prev => !prev);
+    else if (menu === 'lomba') setSidebarLombaDropdownOpen(prev => !prev);
+    else if (menu === 'akun') setSidebarAkunDropdownOpen(prev => !prev);
+    else if (menu === 'sistem') setSidebarSistemDropdownOpen(prev => !prev);
   };
 
   // Custom Application Logo State
@@ -1179,10 +1318,24 @@ export default function App() {
   });
   const [modalBlankoEditorOpen, setModalBlankoEditorOpen] = useState(false);
 
+  // Lomba Cerdas Cermat (Soal Editor Admin + Form Jawaban Akun Sekolah) State
+  const [cerdasCermatConfig, setCerdasCermatConfig] = useState<CerdasCermatConfig>(() =>
+    getCachedCerdasCermatConfigFromLocal()
+  );
+  const [cerdasCermatSubmissions, setCerdasCermatSubmissions] = useState<CerdasCermatSubmission[]>(() =>
+    getCachedCerdasCermatSubmissionsFromLocal()
+  );
+
   // Connectivity & Offline Auto-Sync Queue State
   const isOnline = useOnlineStatus();
   const [pendingOfflineCount, setPendingOfflineCount] = useState<number>(() => getOfflineQueueCount());
+  const [serverBackedUpQueueCount, setServerBackedUpQueueCount] = useState<number>(
+    () => getOfflineQueueStats().backedUpToServerCount
+  );
   const [isSyncingOffline, setIsSyncingOffline] = useState(false);
+  const [serverBackupStatus, setServerBackupStatus] = useState<ServerBackupStatus>(() =>
+    getLatestServerBackupStatus()
+  );
 
   // School Self-Registration State (Layar Login)
   const [authViewTab, setAuthViewTab] = useState<'login' | 'register_sekolah'>('login');
@@ -1204,23 +1357,19 @@ export default function App() {
   const [formPolisiPelajar, setFormPolisiPelajar] = useState(() => ({
     nama: 'Bintang Pratama',
     nisn: '0089123456',
-    sekolah: 'SMP Negeri 1 Majalengka',
-    jenjang: 'SLTP' as SchoolLevel,
-    kelas: 'VIII-A',
-    ttl: 'Majalengka, 15 Januari 2012',
     jk: 'Laki-Laki',
-    agama: 'Islam',
-    alamat: 'Jl. Pemuda No. 45, Majalengka',
-    noHp: '081234567890',
-    namaOrtu: 'Hendra Gunawan',
-    pekerjaanOrtu: 'Wiraswasta',
     tinggiBadan: '165',
     beratBadan: '52',
+    alamat: 'Jl. Pemuda No. 45, Majalengka',
     golDarah: 'O',
-    riwayatPenyakit: 'Tidak Ada',
-    prestasi: 'Juara 2 PBB Tingkat Kabupaten',
-    alasan: 'Ingin mengabdi dan menegakkan ketertiban dan keselamatan di lingkungan sekolah.',
-    ...(initialFormDrafts?.formPolisiPelajar || {})
+    sekolah: 'SMP Negeri 1 Majalengka',
+    jenjang: 'SLTP' as SchoolLevel,
+    ...(initialFormDrafts?.formPolisiPelajar || {}),
+    tanggalLahir: initialFormDrafts?.formPolisiPelajar?.tanggalLahir || '2012-01-15',
+    alergi:
+      initialFormDrafts?.formPolisiPelajar?.alergi ??
+      initialFormDrafts?.formPolisiPelajar?.riwayatPenyakit ??
+      'Tidak Ada'
   }));
 
   const [formCalonPks, setFormCalonPks] = useState<{
@@ -1242,42 +1391,76 @@ export default function App() {
     ...(initialFormDrafts?.formCalonPks || {})
   }));
 
-  const [formBalok1, setFormBalok1] = useState(() => ({
-    namaRegu: 'Regu Elang Sakti',
-    sekolah: 'SMP Negeri 1 Majalengka',
-    jenjang: 'SLTP' as SchoolLevel,
-    namaKetua: 'Fajar Nugraha',
-    jumlahAnggota: '12 Orang',
-    namaPembina: 'Ahmad Fauzi, S.Pd',
-    noHpPembina: '081398765432',
-    kategoriKemah: 'Balok 1 (Tingkat Dasar / Calon Kader PKS)',
-    lokasiPerkemahan: 'Bumi Perkemahan Sindangkasih, Majalengka',
-    tanggalKegiatan: '12 - 14 Juni 2026',
-    statusKesehatan: 'Semua anggota sehat dan siap kegiatan lapangan',
-    suratIzinKepsek: 'No. 421.3/089/SMPN1/2026',
-    ...(initialFormDrafts?.formBalok1 || {})
-  }));
+  const buildInitialCampState = (
+    draft: any,
+    defaultSchool: string,
+    defaultJenjang: SchoolLevel,
+    defaultMaleNames: string[],
+    defaultFemaleNames: string[]
+  ): CampBalokFormData => {
+    const hasNewFields =
+      draft &&
+      (typeof draft.maleCount === 'number' ||
+        typeof draft.femaleCount === 'number' ||
+        Array.isArray(draft.maleNames) ||
+        Array.isArray(draft.femaleNames));
 
-  const [formBalok2, setFormBalok2] = useState(() => ({
-    namaPeserta: 'Rizky Ramadhan',
-    sekolah: 'SMA Negeri 1 Majalengka',
-    jenjang: 'SLTA' as SchoolLevel,
-    kelas: 'XI-IPS 1',
-    noSertifikatBalok1: 'PKS-B1/POLRES-MJL/2025/084',
-    tahunKelulusanBalok1: '2025',
-    jabatanPleton: 'Komandan Pleton (Danton)',
-    namaPembina: 'Iptu Agus Salim',
-    materiUji: 'Penguasaan 12 Gerakan Gatur Lantas, PBB Tongkat, Senam Lantas, Bela Diri Praktis Polri',
-    rekomendasiSatlantas: 'Memenuhi Syarat Kualifikasi Instruktur PKS Balok 2',
-    ...(initialFormDrafts?.formBalok2 || {})
-  }));
+    const maleCount = hasNewFields
+      ? Math.max(0, Math.min(100, Number(draft.maleCount ?? draft.maleNames?.length ?? 0) || 0))
+      : defaultMaleNames.length;
+    const femaleCount = hasNewFields
+      ? Math.max(0, Math.min(100, Number(draft.femaleCount ?? draft.femaleNames?.length ?? 0) || 0))
+      : defaultFemaleNames.length;
+
+    const rawMaleNames = hasNewFields && Array.isArray(draft.maleNames) ? draft.maleNames : defaultMaleNames;
+    const rawFemaleNames = hasNewFields && Array.isArray(draft.femaleNames) ? draft.femaleNames : defaultFemaleNames;
+
+    const maleNames = Array.from({ length: maleCount }, (_, i) => String(rawMaleNames[i] ?? ''));
+    const femaleNames = Array.from({ length: femaleCount }, (_, i) => String(rawFemaleNames[i] ?? ''));
+    const total = maleCount + femaleCount;
+    const mealCount = hasNewFields && typeof draft.mealCount === 'number'
+      ? Math.max(0, Math.min(total, Math.round(draft.mealCount)))
+      : total;
+
+    return {
+      sekolah: String(draft?.sekolah || defaultSchool),
+      jenjang: (draft?.jenjang === 'SLTP' || draft?.jenjang === 'SLTA' ? draft.jenjang : defaultJenjang) as SchoolLevel,
+      maleCount,
+      femaleCount,
+      maleNames,
+      femaleNames,
+      mealCount
+    };
+  };
+
+  const [formBalok1, setFormBalok1] = useState<CampBalokFormData>(() =>
+    buildInitialCampState(
+      initialFormDrafts?.formBalok1,
+      'SMP Negeri 1 Majalengka',
+      'SLTP',
+      ['Fajar Nugraha', 'Dimas Pratama'],
+      ['Siti Aisyah', 'Nabila Putri']
+    )
+  );
+
+  const [formBalok2, setFormBalok2] = useState<CampBalokFormData>(() =>
+    buildInitialCampState(
+      initialFormDrafts?.formBalok2,
+      'SMA Negeri 1 Majalengka',
+      'SLTA',
+      ['Rizky Ramadhan', 'Aditya Saputra'],
+      ['Aulia Rahma', 'Putri Maharani']
+    )
+  );
 
   // Proteksi Hak Akses Akun Tamu, Pembina Polres, Akun Sekolah, Log Aktivitas Khusus Admin, & Pengalihan Tab Lama
   useEffect(() => {
     if (!currentUser) return;
-    const pembinaPolresAllowedTabs = new Set(['dashboard', 'rekap', 'anggota_pks', 'rekap_pendaftaran']);
+    const pembinaPolresAllowedTabs = new Set(['dashboard', 'rekap', 'anggota_pks', 'rekap_pendaftaran', 'profil_sekolah']);
     const sekolahAllowedTabs = new Set([
       'dashboard',
+      'profil_sekolah',
+      'cerdas_cermat_sekolah',
       'anggota_pks',
       'form_polisi_pelajar',
       'form_calon_pks',
@@ -1289,6 +1472,14 @@ export default function App() {
     } else if (currentUser.role === 'pembina_polres' && !pembinaPolresAllowedTabs.has(currentTab)) {
       setCurrentTab('dashboard');
     } else if (currentUser.role === 'sekolah' && !sekolahAllowedTabs.has(currentTab)) {
+      setCurrentTab('dashboard');
+    } else if (currentTab === 'cerdas_cermat_sekolah' && currentUser.role !== 'sekolah') {
+      setCurrentTab('dashboard');
+    } else if (
+      currentTab === 'cerdas_cermat_admin' &&
+      currentUser.role !== 'admin' &&
+      currentUser.role !== 'superadmin'
+    ) {
       setCurrentTab('dashboard');
     } else if (currentTab === 'log_aktivitas') {
       setCurrentTab('dashboard');
@@ -1339,7 +1530,6 @@ export default function App() {
 
   // Loading, Save Sync Status & Network Error Banner States
   const [saveSyncStatus, setSaveSyncStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
-  const [savingCriterionKeys, setSavingCriterionKeys] = useState<Record<string, boolean>>({});
   const [isSavingPeserta, setIsSavingPeserta] = useState(false);
   const [isSavingUser, setIsSavingUser] = useState(false);
   const [isSavingConfig, setIsSavingConfig] = useState(false);
@@ -1352,6 +1542,13 @@ export default function App() {
   const pesertaListRef = useRef<Participant[]>(pesertaList);
   pesertaListRef.current = pesertaList;
   const scoreWriteQueueRef = useRef<Record<string, Promise<void>>>({});
+  const scoreDebounceTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const pendingScoreParticipantIdsRef = useRef<Set<string>>(new Set());
+  const flushPendingScoresRef = useRef<() => void>(() => {});
+  const flushAnyPendingScoreTimers = () => {
+    flushPendingScoresRef.current();
+  };
+  const lastQuotaToastAtRef = useRef<number>(0);
 
   useEffect(() => {
     setSaveSyncStatus('idle');
@@ -1364,7 +1561,9 @@ export default function App() {
   const criteriaSchoolSearchRef = useRef<HTMLDivElement>(null);
 
   // Cloud Firestore Sync State
-  const [cloudStatus, setCloudStatus] = useState<'connecting' | 'connected' | 'offline' | 'error'>('connecting');
+  const [cloudStatus, setCloudStatus] = useState<CloudConnectionStatus>(() =>
+    isCloudWriteQuotaExceeded() ? 'quota_paused' : 'connecting'
+  );
   const [cloudQuotaExceeded, setCloudQuotaExceeded] = useState<boolean>(() => isCloudWriteQuotaExceeded());
   const [quotaBannerDismissed, setQuotaBannerDismissed] = useState(false);
   const [cloudLastSynced, setCloudLastSynced] = useState<Date | null>(null);
@@ -1381,30 +1580,41 @@ export default function App() {
   const isCreatingBackupRef = useRef(false);
   const appMountedAtRef = useRef<number>(Date.now());
 
-  const isInitialCloudSyncDone = useRef(false);
-  const migratedParticipantIdsRef = useRef<Set<string>>(new Set());
-  const hasNormalizedUsersRef = useRef(false);
-  const hasAutoMigratedConfigRef = useRef(false);
+  const resolveStatusFromCloudResult = (res: CloudWriteResult): CloudConnectionStatus => {
+    if (res.isQuotaError) return 'quota_paused';
+    if (res.isNetworkError || res.queuedOffline) return 'offline';
+    if (res.success) return 'connected';
+    return 'error';
+  };
 
   useEffect(() => {
-    return subscribeToCloudQuota(exceeded => {
+    const unsubQuota = subscribeToCloudQuota(exceeded => {
       setCloudQuotaExceeded(exceeded);
       if (exceeded) {
-        setCloudStatus('error');
+        setCloudStatus('quota_paused');
         setQuotaBannerDismissed(false);
       }
     });
+    const unsubServer = subscribeToServerBackupStatus(status => {
+      setServerBackupStatus(status);
+    });
+    return () => {
+      unsubQuota();
+      unsubServer();
+    };
   }, []);
 
   // Browser Online/Offline listener & click-outside handler for criterion school search dropdown
   useEffect(() => {
     const handleOnline = () => {
+      void fetchServerBackupStatus();
+      void syncPendingDeltasToServerBackup();
       if (isCloudWriteQuotaExceeded()) {
-        setCloudStatus('error');
+        setCloudStatus('quota_paused');
         return;
       }
       void testConnection().then(ok => {
-        setCloudStatus(ok ? 'connected' : 'offline');
+        setCloudStatus(ok ? 'connected' : isCloudWriteQuotaExceeded() ? 'quota_paused' : 'offline');
         if (ok) {
           setCloudLastSynced(new Date());
         }
@@ -1434,7 +1644,156 @@ export default function App() {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  // Real-time Cloud Listeners & Auto-Sync
+  // Read-safe merge helper from Express Server Backup
+  const mergeServerBackupIntoLocalState = async (showFeedbackToast = false) => {
+    const serverState = await fetchServerBackupState();
+    if (!serverState || !serverState.available) {
+      if (showFeedbackToast) {
+        showToast('Cadangan server belum tersedia atau perangkat sedang offline.', 'info');
+      }
+      return false;
+    }
+
+    const cols = serverState.collections;
+    let updatedAny = false;
+
+    if (Array.isArray(cols.participants) && cols.participants.length > 0) {
+      const serverMap = new Map<string, any>();
+      cols.participants.forEach(p => {
+        if (p?.id) serverMap.set(p.id, normalizeParticipantScores(p).participant);
+      });
+      const currentMap = new Map<string, Participant>();
+      pesertaListRef.current.forEach(p => currentMap.set(p.id, p));
+
+      serverMap.forEach((srvP, id) => {
+        const curP = currentMap.get(id);
+        const srvTime = Date.parse(srvP.updatedAt || '') || 0;
+        const curTime = Date.parse((curP as any)?.updatedAt || '') || 0;
+        if (!curP || srvTime > curTime) {
+          currentMap.set(id, srvP);
+          updatedAny = true;
+        }
+      });
+
+      if (updatedAny) {
+        const mergedList = Array.from(currentMap.values());
+        pesertaListRef.current = mergedList;
+        setPesertaList(mergedList);
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify({ pesertaList: mergedList }));
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    if (Array.isArray(cols.users) && cols.users.length > 0) {
+      const userMap = new Map<string, AppUser>();
+      usersList.forEach(u => userMap.set(u.username.toLowerCase(), u));
+      let userChanged = false;
+      cols.users.forEach(u => {
+        if (u?.username) {
+          const k = String(u.username).toLowerCase();
+          const curU = userMap.get(k);
+          const srvTime = Date.parse(u.updatedAt || '') || 0;
+          const curTime = Date.parse((curU as any)?.updatedAt || '') || 0;
+          if (!curU || srvTime > curTime) {
+            userMap.set(k, u);
+            userChanged = true;
+          }
+        }
+      });
+      if (userChanged) {
+        const mergedUsers = Array.from(userMap.values());
+        setUsersList(mergedUsers);
+        updatedAny = true;
+        try {
+          localStorage.setItem(USERS_STORAGE_KEY, JSON.stringify(mergedUsers));
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    if (Array.isArray(cols.categories) && cols.categories.length > 0) {
+      const { categories: normalizedCats } = normalizeCategoriesConfig(cols.categories);
+      if (pesertaListRef.current.length === 0 || showFeedbackToast) {
+        setCategories(normalizedCats);
+        setTempCategoriesConfig(normalizedCats);
+        updatedAny = true;
+      }
+    }
+
+    if (Array.isArray(cols.registrations) && cols.registrations.length > 0) {
+      const regMap = new Map<string, RegistrationSubmission>();
+      registrationsList.forEach(r => regMap.set(r.id, r));
+      let regChanged = false;
+      cols.registrations.forEach(r => {
+        if (r?.id) {
+          const curR = regMap.get(r.id);
+          const srvTime = Date.parse(r.updatedAt || '') || 0;
+          const curTime = Date.parse(curR?.updatedAt || '') || 0;
+          if (!curR || srvTime > curTime) {
+            regMap.set(r.id, r);
+            regChanged = true;
+          }
+        }
+      });
+      if (regChanged) {
+        const mergedRegs = Array.from(regMap.values());
+        setRegistrationsList(mergedRegs);
+        updatedAny = true;
+      }
+    }
+
+    if (cols.cerdasCermatConfig && typeof cols.cerdasCermatConfig === 'object') {
+      setCerdasCermatConfig(cols.cerdasCermatConfig as CerdasCermatConfig);
+      try {
+        localStorage.setItem('PBB_PKS_CERDAS_CERMAT_CFG_V1', JSON.stringify(cols.cerdasCermatConfig));
+      } catch {
+        // ignore
+      }
+      updatedAny = true;
+    }
+
+    if (Array.isArray(cols.cerdasCermatSubmissions) && cols.cerdasCermatSubmissions.length > 0) {
+      const ccMap = new Map<string, CerdasCermatSubmission>();
+      cerdasCermatSubmissions.forEach(s => ccMap.set(s.id, s));
+      let ccChanged = false;
+      cols.cerdasCermatSubmissions.forEach(s => {
+        if (s?.id) {
+          const curS = ccMap.get(s.id);
+          const srvTime = Date.parse(s.updatedAt || '') || 0;
+          const curTime = Date.parse(curS?.updatedAt || '') || 0;
+          if (!curS || srvTime > curTime) {
+            ccMap.set(s.id, s);
+            ccChanged = true;
+          }
+        }
+      });
+      if (ccChanged) {
+        setCerdasCermatSubmissions(Array.from(ccMap.values()));
+        updatedAny = true;
+      }
+    }
+
+    if (cols.appStatus && showFeedbackToast) {
+      setAppStatus(cols.appStatus);
+      updatedAny = true;
+    }
+
+    if (showFeedbackToast) {
+      showToast(
+        updatedAny
+          ? 'Data berhasil diperbarui dari Cadangan Server terbaru!'
+          : 'Data di perangkat Anda sudah sama dengan Cadangan Server terbaru.',
+        updatedAny ? 'success' : 'info'
+      );
+    }
+    return updatedAny;
+  };
+
+  // Real-time Cloud Listeners & Read-Safe Startup (Zero-Write Boot)
   useEffect(() => {
     let unsubParticipants: (() => void) | undefined;
     let unsubUsers: (() => void) | undefined;
@@ -1444,44 +1803,59 @@ export default function App() {
     let unsubPayment: (() => void) | undefined;
     let unsubRegistrations: (() => void) | undefined;
     let unsubBlanko: (() => void) | undefined;
+    let unsubCerdasCermatConfig: (() => void) | undefined;
+    let unsubCerdasCermatSubmissions: (() => void) | undefined;
 
     const initCloud = async () => {
       clearLegacyLocalActivityLogs();
+
+      // Check Express server backup in parallel (never consumes Firestore quota)
+      const serverStatusPromise = fetchServerBackupStatus().then(async st => {
+        if (st.available) {
+          await syncPendingDeltasToServerBackup();
+          if (isCloudWriteQuotaExceeded()) {
+            await mergeServerBackupIntoLocalState(false);
+          }
+        }
+        return st;
+      });
+
       try {
+        if (isCloudWriteQuotaExceeded()) {
+          // Quota paused for today -> stay calm in server-backup/local mode instead of flagging startup error
+          setCloudStatus('quota_paused');
+          await serverStatusPromise;
+          return;
+        }
+
         const isOk = await testConnection();
         if (isOk) {
           setCloudStatus('connected');
           setCloudLastSynced(new Date());
-          void purgeLegacyActivityLogsFromCloudAndLocal();
+        } else if (isCloudWriteQuotaExceeded()) {
+          setCloudStatus('quota_paused');
+          await serverStatusPromise;
+          return;
         } else {
           setCloudStatus('offline');
+          await serverStatusPromise;
         }
 
-        // 1. Subscribe to Participants
+        // 1. Subscribe to Participants (Read-only on startup: ZERO automatic Cloud writes)
         unsubParticipants = subscribeToParticipants(
           (cloudPeserta, fromCache) => {
-            const isOnline = typeof navigator === 'undefined' || navigator.onLine;
-            if (!fromCache && isOnline && !isCloudWriteQuotaExceeded()) {
+            const isOnlineNow = typeof navigator === 'undefined' || navigator.onLine;
+            if (!fromCache && isOnlineNow && !isCloudWriteQuotaExceeded()) {
               setCloudStatus('connected');
               setCloudLastSynced(new Date());
-            } else if (!isOnline) {
+            } else if (isCloudWriteQuotaExceeded()) {
+              setCloudStatus('quota_paused');
+            } else if (!isOnlineNow) {
               setCloudStatus('offline');
             }
 
             if (cloudPeserta && cloudPeserta.length > 0) {
-              const normalizedList = cloudPeserta.map(p => {
-                const res = normalizeParticipantScores(p);
-                if (
-                  res.migrated &&
-                  !fromCache &&
-                  !isCloudWriteQuotaExceeded() &&
-                  !migratedParticipantIdsRef.current.has(res.participant.id)
-                ) {
-                  migratedParticipantIdsRef.current.add(res.participant.id);
-                  void saveParticipantToCloud(res.participant);
-                }
-                return res.participant;
-              });
+              const normalizedList = cloudPeserta.map(p => normalizeParticipantScores(p).participant);
               pesertaListRef.current = normalizedList;
               setPesertaList(normalizedList);
               try {
@@ -1489,135 +1863,91 @@ export default function App() {
               } catch {
                 // ignore
               }
-              if (!fromCache) {
-                isInitialCloudSyncDone.current = true;
-              }
-            } else if (
-              !fromCache &&
-              !isInitialCloudSyncDone.current &&
-              !isCloudWriteQuotaExceeded() &&
-              pesertaListRef.current.length > 0
-            ) {
-              // Seed cloud only on verified empty server snapshot
-              isInitialCloudSyncDone.current = true;
-              pesertaListRef.current.forEach(p => {
-                void saveParticipantToCloud(p);
-              });
             }
           },
           err => {
-            console.error('Cloud participants sync error:', err);
-            setCloudStatus('error');
+            console.warn('Cloud participants listener notice:', err);
+            if (isQuotaExceededError(err) || isCloudWriteQuotaExceeded()) {
+              setCloudStatus('quota_paused');
+            } else if (typeof navigator !== 'undefined' && !navigator.onLine) {
+              setCloudStatus('offline');
+            } else {
+              setCloudStatus('error');
+            }
           }
         );
 
-        // 2. Subscribe to Users
+        // 2. Subscribe to Users (Read-only normalization in memory/localStorage: ZERO automatic Cloud writes)
         unsubUsers = subscribeToUsers(
           (cloudUsers, fromCache) => {
-            const isOnline = typeof navigator === 'undefined' || navigator.onLine;
-            if (!fromCache && isOnline && !isCloudWriteQuotaExceeded()) {
+            const isOnlineNow = typeof navigator === 'undefined' || navigator.onLine;
+            if (!fromCache && isOnlineNow && !isCloudWriteQuotaExceeded()) {
               setCloudStatus('connected');
               setCloudLastSynced(new Date());
-            } else if (!isOnline) {
+            } else if (isCloudWriteQuotaExceeded()) {
+              setCloudStatus('quota_paused');
+            } else if (!isOnlineNow) {
               setCloudStatus('offline');
             }
 
             if (cloudUsers && cloudUsers.length > 0) {
-              const canWriteUsers = !fromCache && !isCloudWriteQuotaExceeded() && !hasNormalizedUsersRef.current;
-              let didAutoWrite = false;
-              const adminIdx = cloudUsers.findIndex(u => u.username?.toLowerCase() === 'administrator');
+              let nextUsers = [...cloudUsers];
+              const adminIdx = nextUsers.findIndex(u => u.username?.toLowerCase() === 'administrator');
               if (adminIdx === -1) {
-                const adminAccount: AppUser = {
+                nextUsers.push({
                   username: 'administrator',
                   password: 'adminstrator123',
                   name: 'Administrator Utama (Super Admin)',
                   role: 'superadmin',
                   isCustom: false
-                };
-                if (canWriteUsers) {
-                  didAutoWrite = true;
-                  void saveUserToCloud(adminAccount);
-                }
-                cloudUsers = [...cloudUsers, adminAccount];
-              } else if (cloudUsers[adminIdx].password === 'administrator123' || cloudUsers[adminIdx].password === 'administrator1234') {
-                const updatedAdmin: AppUser = {
-                  ...cloudUsers[adminIdx],
-                  username: 'administrator',
-                  password: 'adminstrator123'
-                };
-                if (canWriteUsers) {
-                  didAutoWrite = true;
-                  void saveUserToCloud(updatedAdmin);
-                }
-                cloudUsers = cloudUsers.map((u, i) => (i === adminIdx ? updatedAdmin : u));
-              }
-              const legacySekolah1 = cloudUsers.find(
-                u => u.username?.toLowerCase() === 'sekolah1' && u.isCustom === false
-              );
-              if (legacySekolah1) {
-                if (canWriteUsers) {
-                  didAutoWrite = true;
-                  void deleteUserFromCloud(legacySekolah1.username);
-                }
-                cloudUsers = cloudUsers.filter(
-                  u => !(u.username?.toLowerCase() === 'sekolah1' && u.isCustom === false)
+                });
+              } else if (
+                nextUsers[adminIdx].password === 'administrator123' ||
+                nextUsers[adminIdx].password === 'administrator1234'
+              ) {
+                nextUsers = nextUsers.map((u, i) =>
+                  i === adminIdx ? { ...u, username: 'administrator', password: 'adminstrator123' } : u
                 );
               }
+              nextUsers = nextUsers.filter(
+                u => !(u.username?.toLowerCase() === 'sekolah1' && u.isCustom === false)
+              );
               if (
-                !cloudUsers.some(
+                !nextUsers.some(
                   u => u.username?.toLowerCase() === 'pembinapolres' || u.role === 'pembina_polres'
                 )
               ) {
-                const pembinaAccount: AppUser = {
+                nextUsers.push({
                   username: 'pembinapolres',
                   password: 'pembina123',
                   name: 'Pembina Polres',
                   role: 'pembina_polres',
                   isCustom: false
-                };
-                if (canWriteUsers) {
-                  didAutoWrite = true;
-                  void saveUserToCloud(pembinaAccount);
-                }
-                cloudUsers = [...cloudUsers, pembinaAccount];
+                });
               }
-              if (didAutoWrite) {
-                hasNormalizedUsersRef.current = true;
-              }
-              setUsersList(cloudUsers);
+              setUsersList(nextUsers);
               try {
-                localStorage.setItem(USERS_STORAGE_KEY, JSON.stringify(cloudUsers));
+                localStorage.setItem(USERS_STORAGE_KEY, JSON.stringify(nextUsers));
               } catch {
                 // ignore
               }
-            } else if (
-              !fromCache &&
-              !isInitialCloudSyncDone.current &&
-              !isCloudWriteQuotaExceeded() &&
-              usersList.length > 0
-            ) {
-              // Seed cloud users only on verified empty server snapshot
-              hasNormalizedUsersRef.current = true;
-              usersList.forEach(u => {
-                void saveUserToCloud(u);
-              });
             }
           },
           err => {
-            console.error('Cloud users sync error:', err);
-            setCloudStatus('error');
+            console.warn('Cloud users listener notice:', err);
+            if (isQuotaExceededError(err) || isCloudWriteQuotaExceeded()) {
+              setCloudStatus('quota_paused');
+            } else if (typeof navigator !== 'undefined' && !navigator.onLine) {
+              setCloudStatus('offline');
+            }
           }
         );
 
-        // 3. Subscribe to Config
+        // 3. Subscribe to Config (Read-only normalization: ZERO automatic Cloud writes)
         unsubConfig = subscribeToConfig(
-          (cloudConfig, fromCache) => {
+          cloudConfig => {
             if (cloudConfig && Array.isArray(cloudConfig) && cloudConfig.length > 0) {
-              const { categories: normalizedCats, migrated } = normalizeCategoriesConfig(cloudConfig);
-              if (migrated && !fromCache && !isCloudWriteQuotaExceeded() && !hasAutoMigratedConfigRef.current) {
-                hasAutoMigratedConfigRef.current = true;
-                void saveConfigToCloud(normalizedCats);
-              }
+              const { categories: normalizedCats } = normalizeCategoriesConfig(cloudConfig);
               setCategories(normalizedCats);
               setTempCategoriesConfig(normalizedCats);
               try {
@@ -1625,17 +1955,9 @@ export default function App() {
               } catch {
                 // ignore
               }
-            } else if (
-              !fromCache &&
-              !isInitialCloudSyncDone.current &&
-              !isCloudWriteQuotaExceeded() &&
-              categories.length > 0
-            ) {
-              hasAutoMigratedConfigRef.current = true;
-              void saveConfigToCloud(categories);
             }
           },
-          err => console.error('Cloud config sync error:', err)
+          err => console.warn('Cloud config listener notice:', err)
         );
 
         // 4. Subscribe to Logo
@@ -1650,10 +1972,10 @@ export default function App() {
               }
             }
           },
-          err => console.error('Cloud logo sync error:', err)
+          err => console.warn('Cloud logo listener notice:', err)
         );
 
-        // 5. Subscribe to App Status (Aktif / Nonaktif dengan Kustom Teks)
+        // 5. Subscribe to App Status (Read-only on startup)
         unsubStatus = subscribeToAppStatus(
           cloudStatusConfig => {
             if (cloudStatusConfig) {
@@ -1663,11 +1985,9 @@ export default function App() {
               } catch {
                 // ignore
               }
-            } else if (!isInitialCloudSyncDone.current && !isCloudWriteQuotaExceeded()) {
-              void saveAppStatusToCloud(appStatus);
             }
           },
-          err => console.error('Cloud app status sync error:', err)
+          err => console.warn('Cloud app status listener notice:', err)
         );
 
         // 6. Subscribe to Payment Configuration & Gateways
@@ -1682,7 +2002,7 @@ export default function App() {
               }
             }
           },
-          err => console.error('Cloud payment config sync error:', err)
+          err => console.warn('Cloud payment config listener notice:', err)
         );
 
         // 7. Subscribe to School Registration Submissions
@@ -1692,7 +2012,7 @@ export default function App() {
               setRegistrationsList(cloudSubmissions);
             }
           },
-          err => console.error('Cloud registrations sync error:', err)
+          err => console.warn('Cloud registrations listener notice:', err)
         );
 
         // 8. Subscribe to Blanko Template Customization
@@ -1707,16 +2027,36 @@ export default function App() {
               }
             }
           },
-          err => console.error('Cloud blanko config sync error:', err)
+          err => console.warn('Cloud blanko config listener notice:', err)
         );
 
+        // 9. Subscribe to Cerdas Cermat Config & Submissions
+        unsubCerdasCermatConfig = subscribeToCerdasCermatConfig(
+          cloudCcCfg => {
+            if (cloudCcCfg) {
+              setCerdasCermatConfig(cloudCcCfg);
+            }
+          },
+          err => console.warn('Cloud cerdas cermat config listener notice:', err)
+        );
+
+        unsubCerdasCermatSubmissions = subscribeToCerdasCermatSubmissions(
+          cloudCcSubs => {
+            if (cloudCcSubs) {
+              setCerdasCermatSubmissions(cloudCcSubs);
+            }
+          },
+          err => console.warn('Cloud cerdas cermat submissions listener notice:', err)
+        );
+
+        await serverStatusPromise;
       } catch (err) {
-        console.error('Cloud initialization failed:', err);
-        setCloudStatus('offline');
+        console.warn('Cloud initialization fallback:', err);
+        setCloudStatus(isCloudWriteQuotaExceeded() ? 'quota_paused' : 'offline');
       }
     };
 
-    initCloud();
+    void initCloud();
 
     return () => {
       if (unsubParticipants) unsubParticipants();
@@ -1727,21 +2067,46 @@ export default function App() {
       if (unsubPayment) unsubPayment();
       if (unsubRegistrations) unsubRegistrations();
       if (unsubBlanko) unsubBlanko();
+      if (unsubCerdasCermatConfig) unsubCerdasCermatConfig();
+      if (unsubCerdasCermatSubmissions) unsubCerdasCermatSubmissions();
     };
   }, []);
 
-  // Subscribe to offline queue count & trigger automatic flush when network comes back online
+  // Subscribe to offline delta queue stats
   useEffect(() => {
     const unsub = subscribeToOfflineQueue(items => {
       setPendingOfflineCount(items.length);
+      setServerBackedUpQueueCount(items.filter(i => i.backedUpToServer).length);
     });
     return unsub;
   }, []);
 
   const handleFlushOfflineQueue = async (silentIfEmpty = true) => {
-    if (isSyncingOffline || !isOnline || isCloudWriteQuotaExceeded()) return;
+    if (isSyncingOffline) return;
+    if (!isOnline) {
+      setCloudStatus('offline');
+      return;
+    }
+
+    // Always mirror pending delta items to Express Server Backup even if Firestore quota is paused
+    await syncPendingDeltasToServerBackup();
+    const statsAfterServer = getOfflineQueueStats();
+    setPendingOfflineCount(statsAfterServer.totalCount);
+    setServerBackedUpQueueCount(statsAfterServer.backedUpToServerCount);
+
+    if (isCloudWriteQuotaExceeded()) {
+      setCloudStatus('quota_paused');
+      if (!silentIfEmpty) {
+        showToast(
+          'Kuota tulis harian Cloud sedang penuh. Perubahan tetap aman di Cadangan Server & perangkat ini.',
+          'info'
+        );
+      }
+      return;
+    }
+
     if (getOfflineQueueCount() === 0) {
-      if (!silentIfEmpty) showToast('Semua data sudah tersinkron dengan Cloud.', 'info');
+      if (!silentIfEmpty) showToast('Semua perubahan sudah tersinkron dengan Cloud.', 'info');
       return;
     }
 
@@ -1749,18 +2114,26 @@ export default function App() {
     setCloudStatus('connecting');
     try {
       const summary = await flushOfflineSyncQueue();
-      setPendingOfflineCount(summary.remainingCount);
-      if (summary.flushedCount > 0) {
+      const latestStats = getOfflineQueueStats();
+      setPendingOfflineCount(latestStats.totalCount);
+      setServerBackedUpQueueCount(latestStats.backedUpToServerCount);
+
+      if (summary.flushedCount > 0 && !summary.hadQuotaError && !summary.hadNetworkError) {
         setCloudStatus('connected');
         setCloudLastSynced(new Date());
         setSaveSyncStatus('saved');
         showToast(
-          `${summary.flushedCount} perubahan offline berhasil disinkronkan otomatis ke Cloud!`,
+          `${summary.flushedCount} perubahan tertunda berhasil disinkronkan ke Cloud!`,
           'success'
         );
       } else if (summary.hadQuotaError) {
-        setCloudStatus('error');
-        showToast('Sinkronisasi terjeda karena kuota tulis harian Cloud tercapai.', 'info');
+        setCloudStatus('quota_paused');
+        showToast(
+          summary.serverBackedUpCount > 0 || latestStats.backedUpToServerCount > 0
+            ? 'Kuota tulis harian Cloud tercapai. Perubahan diamankan di Cadangan Server.'
+            : 'Sinkronisasi ke Cloud terjeda karena kuota tulis harian tercapai.',
+          'info'
+        );
       } else if (summary.hadNetworkError) {
         setCloudStatus('offline');
       }
@@ -1774,56 +2147,140 @@ export default function App() {
       setCloudStatus('offline');
       return;
     }
+    void fetchServerBackupStatus();
+    void syncPendingDeltasToServerBackup();
     if (getOfflineQueueCount() > 0 && !isCloudWriteQuotaExceeded()) {
       void handleFlushOfflineQueue(true);
     }
   }, [isOnline]);
 
-  // Manual Force Push to Cloud
-  const handleForceSyncAll = async () => {
-    setCloudStatus('connecting');
-    await resetCloudWriteQuotaGuard();
-    try {
-      await flushOfflineSyncQueue();
-      for (const p of pesertaList) {
-        const res = await saveParticipantToCloud(p);
-        if (!res.success) throw new Error(res.error || 'Gagal menyinkronkan data peserta.');
-      }
-      for (const u of usersList) {
-        const res = await saveUserToCloud(u);
-        if (!res.success) throw new Error(res.error || 'Gagal menyinkronkan data pengguna.');
-      }
-      const cfgRes = await saveConfigToCloud(categories);
-      if (!cfgRes.success) throw new Error(cfgRes.error || 'Gagal menyinkronkan konfigurasi.');
-      if (appLogo) {
-        const logoRes = await saveLogoToCloud(appLogo);
-        if (!logoRes.success) throw new Error(logoRes.error || 'Gagal menyinkronkan logo.');
-      }
-      const statusRes = await saveAppStatusToCloud(appStatus);
-      if (!statusRes.success) throw new Error(statusRes.error || 'Gagal menyinkronkan status aplikasi.');
-      setCloudStatus('connected');
-      setCloudLastSynced(new Date());
-    } catch (e) {
-      console.error('Force sync error:', e);
-      setCloudStatus(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'error');
-      throw e;
+  // Manual Delta Sync ("Sinkronkan Ulang Sekarang" -> Kirim perubahan tertunda saja agar hemat kuota)
+  const handleForceSyncAll = async (): Promise<DeltaSyncActionResult> => {
+    flushAnyPendingScoreTimers();
+
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      setCloudStatus('offline');
+      return {
+        status: 'offline',
+        flushedCount: 0,
+        remainingCount: getOfflineQueueCount(),
+        serverBackedUpCount: serverBackedUpQueueCount,
+        message: 'Perangkat sedang offline. Perubahan tertunda disimpan aman di perangkat ini.'
+      };
     }
+
+    setCloudStatus('connecting');
+    const serverBackedCountNow = await syncPendingDeltasToServerBackup();
+    await fetchServerBackupStatus();
+
+    const pendingBefore = getOfflineQueueCount();
+    if (pendingBefore === 0) {
+      if (isCloudWriteQuotaExceeded()) {
+        setCloudStatus('quota_paused');
+        return {
+          status: 'quota_paused',
+          flushedCount: 0,
+          remainingCount: 0,
+          serverBackedUpCount: serverBackedCountNow,
+          message: 'Tidak ada perubahan tertunda. Mode hemat kuota & Cadangan Server aktif.'
+        };
+      }
+      const ok = await testConnection();
+      if (ok) {
+        setCloudStatus('connected');
+        setCloudLastSynced(new Date());
+        return {
+          status: 'already_clean',
+          flushedCount: 0,
+          remainingCount: 0,
+          serverBackedUpCount: serverBackedCountNow,
+          message: 'Semua data sudah tersinkron. Tidak ada perubahan tertunda yang perlu dikirim ke Cloud.'
+        };
+      }
+      if (isCloudWriteQuotaExceeded()) {
+        setCloudStatus('quota_paused');
+        return {
+          status: 'quota_paused',
+          flushedCount: 0,
+          remainingCount: 0,
+          serverBackedUpCount: serverBackedCountNow,
+          message: 'Kuota Cloud masih dijeda hari ini. Data tetap aman di Cadangan Server & perangkat.'
+        };
+      }
+      setCloudStatus('offline');
+      return {
+        status: 'offline',
+        flushedCount: 0,
+        remainingCount: 0,
+        serverBackedUpCount: serverBackedCountNow,
+        message: 'Tidak ada antrean tertunda; koneksi ke Cloud belum terjangkau saat ini.'
+      };
+    }
+
+    // Only attempt resetting daily quota guard when user explicitly clicks Sync AND pending deltas exist
+    await resetCloudWriteQuotaGuard();
+    const summary = await flushOfflineSyncQueue();
+    const latestStats = getOfflineQueueStats();
+    setPendingOfflineCount(latestStats.totalCount);
+    setServerBackedUpQueueCount(latestStats.backedUpToServerCount);
+
+    if (summary.hadQuotaError) {
+      setCloudStatus('quota_paused');
+      return {
+        status: 'quota_paused',
+        flushedCount: summary.flushedCount,
+        remainingCount: summary.remainingCount,
+        serverBackedUpCount: summary.serverBackedUpCount,
+        message:
+          summary.flushedCount > 0
+            ? `${summary.flushedCount} delta dikirim, sisa ${summary.remainingCount} diamankan di Cadangan Server (kuota Cloud penuh).`
+            : `Kuota tulis Cloud masih penuh. ${summary.remainingCount} perubahan tertunda aman di Cadangan Server & perangkat.`
+      };
+    }
+
+    if (summary.hadNetworkError) {
+      setCloudStatus('offline');
+      return {
+        status: 'offline',
+        flushedCount: summary.flushedCount,
+        remainingCount: summary.remainingCount,
+        serverBackedUpCount: summary.serverBackedUpCount,
+        message: 'Koneksi ke Cloud terputus. Perubahan tertunda disimpan di Cadangan Server & antrean lokal.'
+      };
+    }
+
+    setCloudStatus('connected');
+    setCloudLastSynced(new Date());
+    setSaveSyncStatus('saved');
+    return {
+      status: 'synced',
+      flushedCount: summary.flushedCount,
+      remainingCount: summary.remainingCount,
+      serverBackedUpCount: summary.serverBackedUpCount,
+      message: `${summary.flushedCount} perubahan tertunda berhasil disinkronkan ke Cloud (hemat kuota)!`
+    };
   };
 
-  // Save App Status to Cloud & Local
+  // Save App Status to Cloud, Server Backup & Local
   const handleSaveAppStatus = async (newStatus: AppStatusConfig): Promise<CloudWriteResult> => {
     const res = await saveAppStatusToCloud(newStatus);
-    if (!res.success && !res.queuedOffline) {
-      setCloudStatus(res.isNetworkError ? 'offline' : 'error');
+    if (!res.success && !res.queuedOffline && !res.isQuotaError) {
+      setCloudStatus(resolveStatusFromCloudResult(res));
       showToast(res.error || 'Gagal menyimpan status aplikasi ke Cloud.', 'error');
       return res;
     }
-    if (res.queuedOffline) {
-      setCloudStatus('offline');
-      showToast('Status aplikasi disimpan offline & otomatis dikirim ke Cloud saat online.', 'info');
-    } else {
-      setCloudStatus('connected');
+    setCloudStatus(resolveStatusFromCloudResult(res));
+    if (res.success) {
       setCloudLastSynced(new Date());
+    } else if (res.isQuotaError) {
+      showToast(
+        res.backedUpToServer
+          ? 'Status aplikasi diamankan di Cadangan Server & lokal (kuota Cloud penuh).'
+          : 'Status aplikasi disimpan lokal hingga kuota Cloud direset.',
+        'info'
+      );
+    } else if (res.queuedOffline) {
+      showToast('Status aplikasi disimpan offline & otomatis dikirim ke Cloud saat online.', 'info');
     }
     setAppStatus(newStatus);
     try {
@@ -1869,6 +2326,8 @@ export default function App() {
     registrationsList,
     paymentConfig,
     blankoConfig,
+    cerdasCermatConfig,
+    cerdasCermatSubmissions,
     appStatus,
     formPolisiPelajar,
     formCalonPks,
@@ -1883,6 +2342,8 @@ export default function App() {
     registrationsList,
     paymentConfig,
     blankoConfig,
+    cerdasCermatConfig,
+    cerdasCermatSubmissions,
     appStatus,
     formPolisiPelajar,
     formCalonPks,
@@ -1914,6 +2375,8 @@ export default function App() {
       localStorage.setItem('PBB_PKS_PAYMENT_CACHE_V1', JSON.stringify(s.paymentConfig));
       localStorage.setItem('PBB_PKS_BLANKO_CACHE_V1', JSON.stringify(s.blankoConfig));
       localStorage.setItem('PBB_PKS_REGISTRATIONS_CACHE_V1', JSON.stringify(s.registrationsList));
+      localStorage.setItem('PBB_PKS_CERDAS_CERMAT_CFG_V1', JSON.stringify(s.cerdasCermatConfig));
+      localStorage.setItem('PBB_PKS_CERDAS_CERMAT_SUBS_V1', JSON.stringify(s.cerdasCermatSubmissions));
     } catch {
       // ignore storage quota errors
     }
@@ -1944,6 +2407,8 @@ export default function App() {
     registrationsList,
     paymentConfig,
     blankoConfig,
+    cerdasCermatConfig,
+    cerdasCermatSubmissions,
     appStatus,
     formPolisiPelajar,
     formCalonPks,
@@ -1951,15 +2416,19 @@ export default function App() {
     formBalok2
   ]);
 
-  // Flush Auto-Save on tab hide / page exit + periodic 30s auto-save & offline queue flush
+  // Flush Auto-Save + pending score delta timers on tab hide / page exit + periodic 30s flush
   useEffect(() => {
     const handleVisibility = () => {
       if (document.visibilityState === 'hidden') {
         flushLocalAutoSaveNow();
+        flushAnyPendingScoreTimers();
+        void syncPendingDeltasToServerBackup();
       }
     };
     const handlePageHide = () => {
       flushLocalAutoSaveNow();
+      flushAnyPendingScoreTimers();
+      void syncPendingDeltasToServerBackup();
     };
     document.addEventListener('visibilitychange', handleVisibility);
     window.addEventListener('pagehide', handlePageHide);
@@ -1968,6 +2437,7 @@ export default function App() {
     const periodicTimer = window.setInterval(() => {
       if (!autoBackupSettingsRef.current.autoSaveEnabled) return;
       flushLocalAutoSaveNow();
+      void syncPendingDeltasToServerBackup();
       if (
         typeof navigator !== 'undefined' &&
         navigator.onLine &&
@@ -1986,7 +2456,7 @@ export default function App() {
     };
   }, []);
 
-  // Load saved backup snapshots on mount & run 1-Hour Auto-Backup scheduler
+  // Load saved backup snapshots on mount & run 1-Hour Auto-Backup scheduler (mirrored to Express Server)
   const createBackupSnapshotNow = async (trigger: 'hourly' | 'manual', silent = false) => {
     if (isCreatingBackupRef.current) return;
     const s = latestStateForBackupRef.current;
@@ -2003,6 +2473,8 @@ export default function App() {
           registrationsList: s.registrationsList,
           paymentConfig: s.paymentConfig,
           blankoConfig: s.blankoConfig,
+          cerdasCermatConfig: s.cerdasCermatConfig,
+          cerdasCermatSubmissions: s.cerdasCermatSubmissions,
           appStatus: s.appStatus
         },
         trigger,
@@ -2010,6 +2482,9 @@ export default function App() {
       );
       const updatedList = await saveBackupSnapshot(record);
       setBackupSnapshots(updatedList);
+      // Mirror hourly/manual snapshot to Express server disk backup (0 Firestore writes!)
+      void pushServerBackupSnapshot(record);
+
       const nowMs = Date.now();
       updateAutoBackupSettingsState(prev => ({
         ...prev,
@@ -2019,11 +2494,11 @@ export default function App() {
       if (!silent) {
         showToast(
           trigger === 'hourly'
-            ? `Cadangan otomatis 1 jam tersimpan (${new Intl.DateTimeFormat('id-ID', {
+            ? `Cadangan otomatis 1 jam tersimpan di perangkat & server (${new Intl.DateTimeFormat('id-ID', {
                 hour: '2-digit',
                 minute: '2-digit'
               }).format(new Date(nowMs))}).`
-            : 'Snapshot cadangan data berhasil dibuat & disimpan!'
+            : 'Snapshot cadangan data berhasil dibuat & disimpan ke perangkat & server!'
         );
       }
     } catch (err) {
@@ -2208,8 +2683,8 @@ export default function App() {
       };
 
       const userSyncRes = await saveUserToCloud(newSchoolUser);
-      if (!userSyncRes.success && !userSyncRes.queuedOffline) {
-        setCloudStatus(userSyncRes.isNetworkError ? 'offline' : 'error');
+      if (!userSyncRes.success && !userSyncRes.queuedOffline && !userSyncRes.isQuotaError) {
+        setCloudStatus(resolveStatusFromCloudResult(userSyncRes));
         setRegError(
           userSyncRes.error ||
             'Terjadi gangguan jaringan saat mendaftarkan akun sekolah. Silakan periksa koneksi lalu coba lagi.'
@@ -2242,12 +2717,12 @@ export default function App() {
           scores: {
             pbb: {}, danton: {},
             devile: {}, gatur: {}, senam: {}, yelyel: {},
-            beladiri: {}, speaking: {}, tenda: {}
+            beladiri: {}, speaking: {}, tenda: {}, cerdas_cermat: {}
           }
         };
         const partSyncRes = await saveParticipantToCloud(newParticipant);
         if (!partSyncRes.success) {
-          setCloudStatus(partSyncRes.isNetworkError ? 'offline' : 'error');
+          setCloudStatus(resolveStatusFromCloudResult(partSyncRes));
         }
         const updatedPeserta = [...pesertaList, newParticipant];
         setPesertaList(updatedPeserta);
@@ -2259,10 +2734,8 @@ export default function App() {
         }
       }
 
-      if (userSyncRes.queuedOffline) {
-        setCloudStatus('offline');
-      } else {
-        setCloudStatus('connected');
+      setCloudStatus(resolveStatusFromCloudResult(userSyncRes));
+      if (userSyncRes.success) {
         setCloudLastSynced(new Date());
       }
       const loginIso = new Date().toISOString();
@@ -2276,10 +2749,12 @@ export default function App() {
         // ignore
       }
       showToast(
-        userSyncRes.queuedOffline
+        userSyncRes.isQuotaError
+          ? `Akun Sekolah ${regSekolah} aktif & diamankan di Cadangan Server (kuota Cloud penuh).`
+          : userSyncRes.queuedOffline
           ? `Registrasi Akun Sekolah ${regSekolah} disimpan offline & akan otomatis tersinkron saat online!`
           : `Registrasi Akun Sekolah ${regSekolah} berhasil! Selamat datang.`,
-        userSyncRes.queuedOffline ? 'info' : 'success'
+        userSyncRes.queuedOffline || userSyncRes.isQuotaError ? 'info' : 'success'
       );
     } finally {
       setIsRegisteringSchool(false);
@@ -2304,15 +2779,13 @@ export default function App() {
     reader.onload = async (event) => {
       const dataUrl = event.target?.result as string;
       const res = await saveLogoToCloud(dataUrl);
-      if (!res.success && !res.queuedOffline) {
-        setCloudStatus(res.isNetworkError ? 'offline' : 'error');
+      if (!res.success && !res.queuedOffline && !res.isQuotaError) {
+        setCloudStatus(resolveStatusFromCloudResult(res));
         showToast(res.error || 'Gagal mengunggah logo ke Cloud.', 'error');
         return;
       }
-      if (res.queuedOffline) {
-        setCloudStatus('offline');
-      } else {
-        setCloudStatus('connected');
+      setCloudStatus(resolveStatusFromCloudResult(res));
+      if (res.success) {
         setCloudLastSynced(new Date());
       }
       setAppLogo(dataUrl);
@@ -2322,10 +2795,12 @@ export default function App() {
         console.error('Storage error', err);
       }
       showToast(
-        res.queuedOffline
+        res.isQuotaError
+          ? 'Logo diperbarui lokal & Cadangan Server (kuota Cloud penuh).'
+          : res.queuedOffline
           ? 'Logo diperbarui lokal (offline) & otomatis tersinkron saat online.'
           : 'Logo aplikasi berhasil diperbarui!',
-        res.queuedOffline ? 'info' : 'success'
+        res.queuedOffline || res.isQuotaError ? 'info' : 'success'
       );
       setModalLogoOpen(false);
     };
@@ -2339,15 +2814,13 @@ export default function App() {
       return { success: false, error: msg, isNetworkError: false };
     }
     const res = await saveLogoToCloud(null);
-    if (!res.success && !res.queuedOffline) {
-      setCloudStatus(res.isNetworkError ? 'offline' : 'error');
+    if (!res.success && !res.queuedOffline && !res.isQuotaError) {
+      setCloudStatus(resolveStatusFromCloudResult(res));
       showToast(res.error || 'Gagal mereset logo di Cloud.', 'error');
       return res;
     }
-    if (res.queuedOffline) {
-      setCloudStatus('offline');
-    } else {
-      setCloudStatus('connected');
+    setCloudStatus(resolveStatusFromCloudResult(res));
+    if (res.success) {
       setCloudLastSynced(new Date());
     }
     setAppLogo(null);
@@ -2357,7 +2830,9 @@ export default function App() {
       // ignore
     }
     showToast(
-      res.queuedOffline
+      res.isQuotaError
+        ? 'Reset logo diamankan di Cadangan Server & lokal (kuota Cloud penuh).'
+        : res.queuedOffline
         ? 'Reset logo disimpan offline & otomatis tersinkron saat online.'
         : 'Logo dikembalikan ke lambang default PKS.',
       'info'
@@ -2377,15 +2852,13 @@ export default function App() {
       return { success: false, error: 'Pilih atau tempel gambar logo terlebih dahulu.', isNetworkError: false };
     }
     const res = await saveLogoToCloud(logoToSave);
-    if (!res.success && !res.queuedOffline) {
-      setCloudStatus(res.isNetworkError ? 'offline' : 'error');
+    if (!res.success && !res.queuedOffline && !res.isQuotaError) {
+      setCloudStatus(resolveStatusFromCloudResult(res));
       showToast(res.error || 'Gagal menyimpan logo ke Cloud.', 'error');
       return res;
     }
-    if (res.queuedOffline) {
-      setCloudStatus('offline');
-    } else {
-      setCloudStatus('connected');
+    setCloudStatus(resolveStatusFromCloudResult(res));
+    if (res.success) {
       setCloudLastSynced(new Date());
     }
     setAppLogo(logoToSave);
@@ -2395,10 +2868,12 @@ export default function App() {
       // ignore
     }
     showToast(
-      res.queuedOffline
+      res.isQuotaError
+        ? 'Logo diperbarui di Cadangan Server & lokal (kuota Cloud penuh).'
+        : res.queuedOffline
         ? 'Logo diperbarui lokal (offline) & otomatis tersinkron saat online.'
         : 'Logo aplikasi berhasil diperbarui!',
-      res.queuedOffline ? 'info' : 'success'
+      res.queuedOffline || res.isQuotaError ? 'info' : 'success'
     );
     setTempLogoUrl('');
     setModalLogoOpen(false);
@@ -2408,44 +2883,47 @@ export default function App() {
   // Export 4 Registration Forms to Excel (.xlsx)
   const handleExportFormPolisiPelajarExcel = () => {
     const wb = XLSX.utils.book_new();
+    const poljarCfg = paymentConfig?.poljarSettings || DEFAULT_PAYMENT_CONFIG.poljarSettings!;
+    const tahunAngkatan = poljarCfg.tahunAngkatan || '2026';
+    const angkatan = normalizeAngkatanCode(poljarCfg.angkatan || '01');
+    const nippPreview =
+      generateNomorIndukPoljar(tahunAngkatan, angkatan, formPolisiPelajar.tanggalLahir) ||
+      'Menunggu Tanggal Lahir';
+
     const rows = [
-      ['FORMULIR PENDAFTARAN RESMI POLISI PELAJAR (POLJAR) TAHUN 2026'],
+      ['FORMULIR PENDAFTARAN RESMI POLISI PELAJAR (POLJAR)'],
       ['DINAS PENDIDIKAN & KEBUDAYAAN KABUPATEN BEKERJASAMA DENGAN SATLANTAS POLRES'],
       [''],
-      ['A. IDENTITAS PRIBADI SISWA'],
-      ['1. Nama Lengkap', formPolisiPelajar.nama],
-      ['2. NISN', formPolisiPelajar.nisn],
-      ['3. Asal Sekolah', formPolisiPelajar.sekolah],
-      ['4. Jenjang / Tingkat', formPolisiPelajar.jenjang],
-      ['5. Kelas', formPolisiPelajar.kelas],
-      ['6. Tempat, Tanggal Lahir', formPolisiPelajar.ttl],
-      ['7. Jenis Kelamin', formPolisiPelajar.jk],
-      ['8. Agama', formPolisiPelajar.agama],
-      ['9. Alamat Lengkap Siswa', formPolisiPelajar.alamat],
-      ['10. No. Handphone / WhatsApp', formPolisiPelajar.noHp],
-      ['11. Nama Orang Tua / Wali', formPolisiPelajar.namaOrtu],
-      ['12. Pekerjaan Orang Tua', formPolisiPelajar.pekerjaanOrtu],
+      ['DATA ANGKATAN & NOMOR INDUK POLISI PELAJAR (NIPP)'],
+      ['Tahun Angkatan (Admin)', tahunAngkatan],
+      ['Angkatan (Admin)', angkatan],
+      ['Nomor Induk Polisi Pelajar (NIPP)', nippPreview],
+      ['Asal Pangkalan Sekolah', `${formPolisiPelajar.sekolah || '-'} (${formPolisiPelajar.jenjang || 'SLTP'})`],
       [''],
-      ['B. DATA FISIK & KESEHATAN'],
-      ['1. Tinggi Badan (cm)', formPolisiPelajar.tinggiBadan],
-      ['2. Berat Badan (kg)', formPolisiPelajar.beratBadan],
-      ['3. Golongan Darah', formPolisiPelajar.golDarah],
-      ['4. Riwayat Penyakit / Alergi', formPolisiPelajar.riwayatPenyakit],
-      [''],
-      ['C. MOTIVASI & PRESTASI'],
-      ['1. Prestasi yang Pernah Diraih', formPolisiPelajar.prestasi],
-      ['2. Alasan Mengikuti Poljar', formPolisiPelajar.alasan],
+      ['DATA CALON ANGGOTA POLISI PELAJAR'],
+      ['1. Nama Lengkap', formPolisiPelajar.nama || '-'],
+      ['2. NISN', formPolisiPelajar.nisn || '-'],
+      ['3. Tanggal Lahir', formPolisiPelajar.tanggalLahir || '-'],
+      ['4. Jenis Kelamin', formPolisiPelajar.jk || '-'],
+      ['5. Tinggi Badan (cm)', formPolisiPelajar.tinggiBadan || '-'],
+      ['6. Berat Badan (kg)', formPolisiPelajar.beratBadan || '-'],
+      ['7. Alamat', formPolisiPelajar.alamat || '-'],
+      ['8. Golongan Darah', formPolisiPelajar.golDarah || '-'],
+      ['9. Alergi', formPolisiPelajar.alergi || '-'],
       [''],
       ['Mengetahui,', '', 'Majalengka, ' + new Date().toLocaleDateString('id-ID')],
-      ['Orang Tua / Wali Siswa', '', 'Calon Siswa Polisi Pelajar'],
+      ['Pembina PKS Pangkalan', '', 'Calon Anggota Polisi Pelajar'],
       [''],
       [''],
-      [`(${formPolisiPelajar.namaOrtu})`, '', `(${formPolisiPelajar.nama})`]
+      ['(...................................)', '', `(${formPolisiPelajar.nama || '...................................'})`]
     ];
     const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws['!cols'] = [{ wch: 32 }, { wch: 45 }, { wch: 30 }];
+    ws['!cols'] = [{ wch: 34 }, { wch: 45 }, { wch: 30 }];
     XLSX.utils.book_append_sheet(wb, ws, 'Pendaftaran_Poljar');
-    XLSX.writeFile(wb, `Form_Pendaftaran_Polisi_Pelajar_${formPolisiPelajar.nama.replace(/\s+/g, '_')}.xlsx`);
+    XLSX.writeFile(
+      wb,
+      `Form_Pendaftaran_Polisi_Pelajar_${(formPolisiPelajar.nama || 'Siswa').replace(/\s+/g, '_')}.xlsx`
+    );
     showToast('Form Pendaftaran Polisi Pelajar berhasil diunduh (.xlsx)', 'success');
   };
 
@@ -2481,71 +2959,88 @@ export default function App() {
     showToast('Form Pendaftaran Calon PKS berhasil diunduh (.xlsx)', 'success');
   };
 
-  const handleExportFormBalok1Excel = () => {
+  const buildCampExcelWorkbook = (
+    title: string,
+    subtitle: string,
+    sheetName: string,
+    fileNamePrefix: string,
+    formState: CampBalokFormData,
+    feeCfg: { fee: number; mealFee?: number; schoolFee?: number; isFree: boolean },
+    includeSchoolFee: boolean = false
+  ) => {
+    const maleNames = Array.from({ length: Math.max(0, formState.maleCount) }, (_, i) => formState.maleNames?.[i] || '-');
+    const femaleNames = Array.from({ length: Math.max(0, formState.femaleCount) }, (_, i) => formState.femaleNames?.[i] || '-');
+    const totalPeserta = maleNames.length + femaleNames.length;
+    const mealCount = Math.max(0, Math.min(totalPeserta, Number(formState.mealCount || 0)));
+    const schoolFee = includeSchoolFee && !feeCfg.isFree
+      ? Number(feeCfg.schoolFee ?? DEFAULT_PAYMENT_CONFIG.formFees.kemah_balok1.schoolFee ?? 100000)
+      : 0;
+    const baseFee = feeCfg.isFree ? 0 : Number(feeCfg.fee || 0);
+    const mealFee = feeCfg.isFree ? 0 : Number(feeCfg.mealFee ?? 25000);
+    const baseSubtotal = totalPeserta * baseFee;
+    const mealSubtotal = mealCount * mealFee;
+    const totalBayar = schoolFee + baseSubtotal + mealSubtotal;
+
     const wb = XLSX.utils.book_new();
-    const rows = [
-      ['FORMULIR PENDAFTARAN PERKEMAHAN PELANTIKAN PKS TINGKAT DASAR (BALOK 1)'],
-      ['DIKLAT DASAR KEPEMIMPINAN DAN KELALULINTASAN PELAJAR TAHUN 2026'],
+    const rows: (string | number)[][] = [
+      [title],
+      [subtitle],
       [''],
-      ['A. DATA REGU / KONTINGEN SEKOLAH'],
-      ['1. Nama Regu / Peleton', formBalok1.namaRegu],
-      ['2. Pangkalan Sekolah', formBalok1.sekolah],
-      ['3. Tingkat / Jenjang', formBalok1.jenjang],
-      ['4. Nama Ketua Regu', formBalok1.namaKetua],
-      ['5. Jumlah Anggota Regu', formBalok1.jumlahAnggota],
-      ['6. Pembina Pendamping', formBalok1.namaPembina],
-      ['7. No. Kontak Pembina', formBalok1.noHpPembina],
+      ['A. DATA PANGKALAN & REKAP JUMLAH PESERTA'],
+      ['Pangkalan Sekolah', formState.sekolah || '-'],
+      ['Jenjang', formState.jenjang || 'SLTP'],
+      ['Jumlah Peserta Laki-laki (Putra)', maleNames.length],
+      ['Jumlah Peserta Perempuan (Putri)', femaleNames.length],
+      ['Total Peserta Perkemahan', totalPeserta],
+      ['Jumlah Peserta Include Konsumsi', mealCount],
       [''],
-      ['B. DETAIL KEGIATAN PERKEMAHAN'],
-      ['1. Tingkat Pelantikan', formBalok1.kategoriKemah],
-      ['2. Lokasi Perkemahan', formBalok1.lokasiPerkemahan],
-      ['3. Waktu Pelaksanaan', formBalok1.tanggalKegiatan],
-      ['4. Status Kesehatan Regu', formBalok1.statusKesehatan],
-      ['5. Surat Rekomendasi Kepala Sekolah', formBalok1.suratIzinKepsek],
+      ['B. RINCIAN SINKRONISASI TOTAL PEMBAYARAN'],
+      ...(includeSchoolFee
+        ? [['Biaya Wajib Sekolah (Per Pengajuan · Cash Penuh)', '1 Formulir Sekolah', `Rp ${schoolFee.toLocaleString('id-ID')}`]]
+        : []),
+      ['Biaya Dasar Peserta', `${totalPeserta} x Rp ${baseFee.toLocaleString('id-ID')}`, `Rp ${baseSubtotal.toLocaleString('id-ID')}`],
+      ['Biaya Konsumsi Peserta', `${mealCount} x Rp ${mealFee.toLocaleString('id-ID')}`, `Rp ${mealSubtotal.toLocaleString('id-ID')}`],
+      [includeSchoolFee ? 'Total Pembayaran (Wajib Cash 100%)' : 'Total Pembayaran', '', `Rp ${totalBayar.toLocaleString('id-ID')}`],
       [''],
-      ['Mengetahui,', '', 'Didaftarkan Oleh,'],
-      ['Kepala Sekolah / Pangkalan', '', 'Pembina Pendamping PKS'],
-      [''],
-      [''],
-      ['(....................................)', '', `(${formBalok1.namaPembina})`]
+      ['C. DAFTAR NAMA PESERTA'],
+      ['No', 'Nama Lengkap Peserta', 'Jenis Kelamin'],
+      ...maleNames.map((nama, idx) => [idx + 1, nama, 'Laki-laki (Putra)']),
+      ...femaleNames.map((nama, idx) => [maleNames.length + idx + 1, nama, 'Perempuan (Putri)'])
     ];
     const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws['!cols'] = [{ wch: 35 }, { wch: 45 }, { wch: 30 }];
-    XLSX.utils.book_append_sheet(wb, ws, 'Perkemahan_Balok1');
-    XLSX.writeFile(wb, `Form_Perkemahan_Balok1_${formBalok1.sekolah.replace(/\s+/g, '_')}.xlsx`);
+    ws['!cols'] = [{ wch: 42 }, { wch: 38 }, { wch: 24 }];
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    const safeSchool = (formState.sekolah || 'Sekolah').replace(/\s+/g, '_');
+    XLSX.writeFile(wb, `${fileNamePrefix}_${safeSchool}.xlsx`);
+  };
+
+  const handleExportFormBalok1Excel = () => {
+    const feeCfg = {
+      ...DEFAULT_PAYMENT_CONFIG.formFees.kemah_balok1,
+      ...(paymentConfig?.formFees?.kemah_balok1 || {})
+    };
+    buildCampExcelWorkbook(
+      'FORMULIR PENDAFTARAN PERKEMAHAN PKS (BALOK 1)',
+      'REKAP PESERTA BERDASARKAN JENIS KELAMIN, BIAYA WAJIB SEKOLAH, KONSUMSI & TOTAL PEMBAYARAN',
+      'Perkemahan_Balok1',
+      'Form_Perkemahan_Balok1',
+      formBalok1,
+      feeCfg,
+      true
+    );
     showToast('Form Perkemahan PKS Balok 1 berhasil diunduh (.xlsx)', 'success');
   };
 
   const handleExportFormBalok2Excel = () => {
-    const wb = XLSX.utils.book_new();
-    const rows = [
-      ['FORMULIR PENDAFTARAN PERKEMAHAN TINGKAT LANJUTAN (BALOK 2)'],
-      ['DIKLAT KEPEMIMPINAN KOMANDAN REGU & INSTRUKTUR PKS TAHUN 2026'],
-      [''],
-      ['A. DATA CALON KADER BALOK 2'],
-      ['1. Nama Lengkap Peserta', formBalok2.namaPeserta],
-      ['2. Pangkalan Sekolah', formBalok2.sekolah],
-      ['3. Jenjang / Tingkat', formBalok2.jenjang],
-      ['4. Kelas', formBalok2.kelas],
-      ['5. No. Sertifikat Balok 1', formBalok2.noSertifikatBalok1],
-      ['6. Tahun Kelulusan Balok 1', formBalok2.tahunKelulusanBalok1],
-      ['7. Jabatan Saat Ini', formBalok2.jabatanPleton],
-      ['8. Pembina Rekomendasi', formBalok2.namaPembina],
-      [''],
-      ['B. MATERI UJI KOMPETENSI PRASYARAT'],
-      ['1. Materi Pengujian', formBalok2.materiUji],
-      ['2. Rekomendasi Satlantas/Polres', formBalok2.rekomendasiSatlantas],
-      [''],
-      ['Mengetahui,', '', 'Pemohon Calon Balok 2,'],
-      ['Instruktur Satlantas / Pembina', '', 'Peserta Diklat Lanjutan'],
-      [''],
-      [''],
-      [`(${formBalok2.namaPembina})`, '', `(${formBalok2.namaPeserta})`]
-    ];
-    const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws['!cols'] = [{ wch: 35 }, { wch: 45 }, { wch: 30 }];
-    XLSX.utils.book_append_sheet(wb, ws, 'Pendaftaran_Balok2');
-    XLSX.writeFile(wb, `Form_Pendaftaran_PKS_Balok2_${formBalok2.namaPeserta.replace(/\s+/g, '_')}.xlsx`);
+    const feeCfg = paymentConfig?.formFees?.pks_balok2 || DEFAULT_PAYMENT_CONFIG.formFees.pks_balok2;
+    buildCampExcelWorkbook(
+      'FORMULIR PENDAFTARAN PERKEMAHAN & UJIAN PKS (BALOK 2)',
+      'REKAP PESERTA BERDASARKAN JENIS KELAMIN, KONSUMSI & TOTAL PEMBAYARAN',
+      'Pendaftaran_Balok2',
+      'Form_Pendaftaran_PKS_Balok2',
+      formBalok2,
+      feeCfg
+    );
     showToast('Form Pendaftaran PKS Balok 2 berhasil diunduh (.xlsx)', 'success');
   };
 
@@ -2627,7 +3122,8 @@ export default function App() {
       schoolName: finalRole === 'sekolah' ? (userFormData.schoolName?.trim() || '') : (originalUser?.schoolName || ''),
       schoolLevel: finalRole === 'sekolah' ? (userFormData.schoolLevel || 'SLTP') : (originalUser?.schoolLevel || 'SLTP'),
       pembinaName: finalRole === 'sekolah' ? (userFormData.pembinaName?.trim() || '') : (originalUser?.pembinaName || ''),
-      contactWa: finalRole === 'sekolah' ? (userFormData.contactWa?.trim() || '') : (originalUser?.contactWa || '')
+      contactWa: finalRole === 'sekolah' ? (userFormData.contactWa?.trim() || '') : (originalUser?.contactWa || ''),
+      ...(originalUser?.schoolProfile ? { schoolProfile: originalUser.schoolProfile } : {})
     };
 
     setModalErrorBanner(null);
@@ -2635,8 +3131,8 @@ export default function App() {
 
     try {
       const syncRes = await saveUserToCloud(updatedUser);
-      if (!syncRes.success && !syncRes.queuedOffline) {
-        setCloudStatus(syncRes.isNetworkError ? 'offline' : 'error');
+      if (!syncRes.success && !syncRes.queuedOffline && !syncRes.isQuotaError) {
+        setCloudStatus(resolveStatusFromCloudResult(syncRes));
         setModalErrorBanner({
           title: syncRes.isNetworkError
             ? 'Gagal Memperbarui Akun (Gangguan Jaringan)'
@@ -2653,10 +3149,8 @@ export default function App() {
         await deleteUserFromCloud(editingUserOriginalUsername);
       }
 
-      if (syncRes.queuedOffline) {
-        setCloudStatus('offline');
-      } else {
-        setCloudStatus('connected');
+      setCloudStatus(resolveStatusFromCloudResult(syncRes));
+      if (syncRes.success) {
         setCloudLastSynced(new Date());
       }
 
@@ -2686,10 +3180,12 @@ export default function App() {
       });
       setUserFormTab('list');
       showToast(
-        syncRes.queuedOffline
+        syncRes.isQuotaError
+          ? `Akun "${dname}" diamankan di Cadangan Server & lokal (kuota Cloud penuh).`
+          : syncRes.queuedOffline
           ? `Akun "${dname}" disimpan offline & akan otomatis tersinkron saat online.`
           : `Akun "${dname}" berhasil diperbarui & tersinkron ke Cloud!`,
-        syncRes.queuedOffline ? 'info' : 'success'
+        syncRes.queuedOffline || syncRes.isQuotaError ? 'info' : 'success'
       );
     } finally {
       setIsSavingUser(false);
@@ -2699,6 +3195,209 @@ export default function App() {
   const handleUpdateUser = async (e: React.FormEvent) => {
     e.preventDefault();
     await executeUpdateUser();
+  };
+
+  const handleSaveSchoolProfile = async (updatedSchoolUser: AppUser): Promise<CloudWriteResult> => {
+    const syncRes = await saveUserToCloud(updatedSchoolUser);
+    if (!syncRes.success && !syncRes.queuedOffline && !syncRes.isQuotaError) {
+      setCloudStatus(resolveStatusFromCloudResult(syncRes));
+      showToast(syncRes.error || 'Gagal menyimpan Profile Sekolah ke Cloud.', 'error');
+      return syncRes;
+    }
+
+    setCloudStatus(resolveStatusFromCloudResult(syncRes));
+    if (syncRes.success) {
+      setCloudLastSynced(new Date());
+    }
+
+    const cleanUsername = updatedSchoolUser.username.toLowerCase();
+    const nextUsersList = usersList.map(u =>
+      u.username.toLowerCase() === cleanUsername ? updatedSchoolUser : u
+    );
+    setUsersList(nextUsersList);
+    try {
+      localStorage.setItem(USERS_STORAGE_KEY, JSON.stringify(nextUsersList));
+    } catch {
+      // ignore
+    }
+
+    if (currentUser && currentUser.username.toLowerCase() === cleanUsername) {
+      setCurrentUser(updatedSchoolUser);
+      try {
+        sessionStorage.setItem(AUTH_KEY, JSON.stringify(updatedSchoolUser));
+      } catch {
+        // ignore
+      }
+    }
+
+    const schoolLabel = updatedSchoolUser.schoolName || updatedSchoolUser.name;
+    showToast(
+      syncRes.isQuotaError
+        ? `Profile sekolah "${schoolLabel}" diamankan di Cadangan Server & lokal (kuota Cloud penuh).`
+        : syncRes.queuedOffline
+        ? `Profile sekolah "${schoolLabel}" disimpan offline & akan otomatis tersinkron saat online.`
+        : `Profile sekolah "${schoolLabel}" berhasil diperbarui & tersinkron ke Cloud!`,
+      syncRes.queuedOffline || syncRes.isQuotaError ? 'info' : 'success'
+    );
+    return syncRes;
+  };
+
+  // Lomba Cerdas Cermat Handlers (Admin Soal Editor, School Once-Submit, Admin Grade + Auto Sync ke Rekap Utama)
+  const syncCerdasCermatMaxPointsIfNeeded = async (neededMaxPoints: number) => {
+    const safeMax = Math.max(10, Math.round(neededMaxPoints || 100));
+    const currentCC = categories.find(c => c.key === 'cerdas_cermat');
+    if (!currentCC || currentCC.maxPoints === safeMax) return;
+    const nextCategories = categories.map(c =>
+      c.key === 'cerdas_cermat' ? { ...c, maxPoints: safeMax } : c
+    );
+    setCategories(nextCategories);
+    setTempCategoriesConfig(nextCategories);
+    try {
+      localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(nextCategories));
+    } catch {
+      // ignore
+    }
+    await saveConfigToCloud(nextCategories);
+  };
+
+  const handleSaveCerdasCermatConfig = async (nextConfig: CerdasCermatConfig): Promise<CloudWriteResult> => {
+    const res = await saveCerdasCermatConfigToCloud(nextConfig);
+    setCerdasCermatConfig(nextConfig);
+    if (res.success || res.queuedOffline || res.isQuotaError) {
+      setCloudStatus(resolveStatusFromCloudResult(res));
+      if (res.success) setCloudLastSynced(new Date());
+
+      const maxSLTP = (nextConfig.questions || [])
+        .filter(q => q.targetLevel === 'ALL' || q.targetLevel === 'SLTP')
+        .reduce((sum, q) => sum + (Number(q.maxPoints) || 0), 0);
+      const maxSLTA = (nextConfig.questions || [])
+        .filter(q => q.targetLevel === 'ALL' || q.targetLevel === 'SLTA')
+        .reduce((sum, q) => sum + (Number(q.maxPoints) || 0), 0);
+      const maxQuizPoints = Math.max(10, maxSLTP, maxSLTA);
+      await syncCerdasCermatMaxPointsIfNeeded(maxQuizPoints);
+
+      showToast(
+        res.isQuotaError
+          ? 'Konfigurasi & soal Cerdas Cermat diamankan ke Cadangan Server & lokal.'
+          : res.queuedOffline
+          ? 'Perubahan soal disimpan offline & akan sinkron otomatis saat online.'
+          : 'Konfigurasi & daftar soal Lomba Cerdas Cermat berhasil disimpan!',
+        res.queuedOffline || res.isQuotaError ? 'info' : 'success'
+      );
+    } else {
+      setCloudStatus(resolveStatusFromCloudResult(res));
+      showToast(res.error || 'Gagal menyimpan soal Cerdas Cermat ke Cloud.', 'error');
+    }
+    return res;
+  };
+
+  const handleSubmitSchoolCerdasCermat = async (
+    submission: CerdasCermatSubmission
+  ): Promise<CloudWriteResult> => {
+    const res = await saveCerdasCermatSubmissionToCloud(submission);
+    if (res.success || res.queuedOffline || res.isQuotaError) {
+      setCerdasCermatSubmissions(prev => {
+        const filtered = prev.filter(s => s.id !== submission.id);
+        return [submission, ...filtered];
+      });
+      setCloudStatus(resolveStatusFromCloudResult(res));
+      if (res.success) setCloudLastSynced(new Date());
+      showToast(
+        res.isQuotaError
+          ? 'Jawaban berhasil dikirim (diamankan di Cadangan Server & lokal). Nilai menunggu penilaian Admin.'
+          : res.queuedOffline
+          ? 'Jawaban tersimpan offline & akan otomatis dikirim ke Cloud saat online.'
+          : 'Jawaban Lomba Cerdas Cermat berhasil dikirim! Nilai akan tampil setelah dinilai Admin.',
+        res.queuedOffline || res.isQuotaError ? 'info' : 'success'
+      );
+    } else {
+      setCloudStatus(resolveStatusFromCloudResult(res));
+      showToast(res.error || 'Gagal mengirim jawaban Cerdas Cermat.', 'error');
+    }
+    return res;
+  };
+
+  const handleGradeCerdasCermatSubmission = async (
+    gradedSubmission: CerdasCermatSubmission,
+    participantIdToSync: string
+  ): Promise<CloudWriteResult> => {
+    const res = await saveCerdasCermatSubmissionToCloud(gradedSubmission);
+    if (!res.success && !res.queuedOffline && !res.isQuotaError) {
+      setCloudStatus(resolveStatusFromCloudResult(res));
+      showToast(res.error || 'Gagal menyimpan penilaian Cerdas Cermat.', 'error');
+      return res;
+    }
+
+    setCerdasCermatSubmissions(prev => {
+      const idx = prev.findIndex(s => s.id === gradedSubmission.id);
+      if (idx === -1) return [gradedSubmission, ...prev];
+      const next = [...prev];
+      next[idx] = gradedSubmission;
+      return next;
+    });
+
+    const currentCatCC = categories.find(c => c.key === 'cerdas_cermat');
+    const neededMax = Math.max(
+      currentCatCC?.maxPoints || 100,
+      gradedSubmission.maxPossibleScore || 0,
+      gradedSubmission.totalScore || 0
+    );
+    if (currentCatCC && neededMax > currentCatCC.maxPoints) {
+      await syncCerdasCermatMaxPointsIfNeeded(neededMax);
+    }
+
+    let syncedSchoolLabel = '';
+    if (participantIdToSync) {
+      const targetParticipant = pesertaListRef.current.find(p => p.id === participantIdToSync);
+      if (targetParticipant) {
+        syncedSchoolLabel = targetParticipant.sekolah;
+        const updatedParticipant: Participant = {
+          ...targetParticipant,
+          scores: {
+            ...targetParticipant.scores,
+            cerdas_cermat: {
+              1: Number(gradedSubmission.totalScore) || 0
+            }
+          }
+        };
+        const nextList = pesertaListRef.current.map(p =>
+          p.id === participantIdToSync ? updatedParticipant : p
+        );
+        pesertaListRef.current = nextList;
+        setPesertaList(nextList);
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify({ pesertaList: nextList }));
+        } catch {
+          // ignore
+        }
+        await saveParticipantToCloud(updatedParticipant);
+      }
+    }
+
+    setCloudStatus(resolveStatusFromCloudResult(res));
+    if (res.success) setCloudLastSynced(new Date());
+
+    showToast(
+      syncedSchoolLabel
+        ? `Nilai Cerdas Cermat (${gradedSubmission.totalScore} pt) disahkan & otomatis masuk ke Rekap Utama "${syncedSchoolLabel}"!`
+        : `Nilai Cerdas Cermat (${gradedSubmission.totalScore} pt) berhasil disimpan & disahkan!`,
+      res.queuedOffline || res.isQuotaError ? 'info' : 'success'
+    );
+    return res;
+  };
+
+  const handleDeleteCerdasCermatSubmission = async (
+    submissionId: string
+  ): Promise<CloudWriteResult> => {
+    const res = await deleteCerdasCermatSubmissionFromCloud(submissionId);
+    if (res.success || res.queuedOffline || res.isQuotaError) {
+      setCerdasCermatSubmissions(prev => prev.filter(s => s.id !== submissionId));
+      setCloudStatus(resolveStatusFromCloudResult(res));
+      showToast('Submission berhasil direset. Sekolah sekarang dapat mengisi ulang form.', 'info');
+    } else {
+      showToast(res.error || 'Gagal mereset submission Cerdas Cermat.', 'error');
+    }
+    return res;
   };
 
   const executeSaveUser = async () => {
@@ -2736,8 +3435,8 @@ export default function App() {
 
     try {
       const syncRes = await saveUserToCloud(newUser);
-      if (!syncRes.success && !syncRes.queuedOffline) {
-        setCloudStatus(syncRes.isNetworkError ? 'offline' : 'error');
+      if (!syncRes.success && !syncRes.queuedOffline && !syncRes.isQuotaError) {
+        setCloudStatus(resolveStatusFromCloudResult(syncRes));
         setModalErrorBanner({
           title: syncRes.isNetworkError
             ? 'Gagal Menyimpan Pengguna Baru (Gangguan Jaringan)'
@@ -2750,10 +3449,8 @@ export default function App() {
         return;
       }
 
-      if (syncRes.queuedOffline) {
-        setCloudStatus('offline');
-      } else {
-        setCloudStatus('connected');
+      setCloudStatus(resolveStatusFromCloudResult(syncRes));
+      if (syncRes.success) {
         setCloudLastSynced(new Date());
       }
 
@@ -2766,10 +3463,12 @@ export default function App() {
       }
 
       showToast(
-        syncRes.queuedOffline
+        syncRes.isQuotaError
+          ? `Pengguna baru "${dname}" diamankan di Cadangan Server & lokal (kuota Cloud penuh).`
+          : syncRes.queuedOffline
           ? `Pengguna baru "${dname}" disimpan offline & akan otomatis tersinkron saat online.`
           : `Pengguna baru "${dname}" (${newUser.role.toUpperCase()}) berhasil dibuat & tersinkron ke Cloud!`,
-        syncRes.queuedOffline ? 'info' : 'success'
+        syncRes.queuedOffline || syncRes.isQuotaError ? 'info' : 'success'
       );
 
       setUserFormData({
@@ -2797,8 +3496,8 @@ export default function App() {
     setConfirmLoading(true);
     try {
       const res = await deleteUserFromCloud(usernameToDelete);
-      if (!res.success && !res.queuedOffline) {
-        setCloudStatus(res.isNetworkError ? 'offline' : 'error');
+      if (!res.success && !res.queuedOffline && !res.isQuotaError) {
+        setCloudStatus(resolveStatusFromCloudResult(res));
         setConfirmModal(prev => ({ ...prev, isOpen: false }));
         setWorkspaceErrorBanner({
           title: 'Gagal Menghapus Akun Pengguna di Cloud',
@@ -2817,16 +3516,16 @@ export default function App() {
       } catch {
         // ignore
       }
-      if (res.queuedOffline) {
-        setCloudStatus('offline');
-      } else {
-        setCloudStatus('connected');
+      setCloudStatus(resolveStatusFromCloudResult(res));
+      if (res.success) {
         setCloudLastSynced(new Date());
       }
       setWorkspaceErrorBanner(null);
       setConfirmModal(prev => ({ ...prev, isOpen: false }));
       showToast(
-        res.queuedOffline
+        res.isQuotaError
+          ? 'Penghapusan akun diamankan di Cadangan Server & antrean delta (kuota Cloud penuh).'
+          : res.queuedOffline
           ? 'Penghapusan akun disimpan offline & otomatis dikirim ke Cloud saat online.'
           : 'Akun pengguna berhasil dihapus dari Cloud & lokal.',
         'info'
@@ -2891,10 +3590,15 @@ export default function App() {
     return calculateAllCategories(activePeserta, categories);
   }, [activePeserta, categories]);
 
-  // Active Category (if current tab is one of the category keys)
+  // Scoring Categories (Kategori yang dinilai juri lapangan dengan skala KS/K/C/B/A; tidak termasuk Cerdas Cermat)
+  const scoringCategories = useMemo(() => {
+    return categories.filter(c => c.key !== 'cerdas_cermat');
+  }, [categories]);
+
+  // Active Category (if current tab is one of the field scoring category keys)
   const activeCategory = useMemo(() => {
-    return categories.find(c => c.key === currentTab) || null;
-  }, [categories, currentTab]);
+    return scoringCategories.find(c => c.key === currentTab) || null;
+  }, [scoringCategories, currentTab]);
 
   // Live Map of Participant Totals & Completed Categories for Sidebar Badges
   const pesertaSummariesMap = useMemo(() => {
@@ -3031,76 +3735,43 @@ export default function App() {
     }
   };
 
-  // Handle Score Selection (serialized per participant to prevent concurrent overwrite races)
-  const executeScoreMutation = (
+  // Flush coalesced score delta for one participant to Server Backup & Cloud Firestore
+  const flushCoalescedScoreDelta = async (
     targetParticipantId: string,
-    categoryKey: CategoryKey,
-    criterionNo: number,
-    val: number | null
+    rollbackContext?: { categoryKey: CategoryKey; criterionNo: number; previousVal: number | undefined }
   ): Promise<void> => {
-    const rowKey = `${targetParticipantId}:${categoryKey}:${criterionNo}`;
     const prevChain = scoreWriteQueueRef.current[targetParticipantId] || Promise.resolve();
-
     const nextTask = prevChain.then(async () => {
-      const targetParticipant = pesertaListRef.current.find(p => p.id === targetParticipantId);
-      if (!targetParticipant) return;
+      pendingScoreParticipantIdsRef.current.delete(targetParticipantId);
+      const latestP = pesertaListRef.current.find(p => p.id === targetParticipantId);
+      if (!latestP) return;
 
-      const previousVal = targetParticipant.scores?.[categoryKey]?.[criterionNo];
-      const currentCatScores = { ...(targetParticipant.scores?.[categoryKey] || {}) };
-      if (val === null) {
-        delete currentCatScores[criterionNo];
-      } else {
-        currentCatScores[criterionNo] = val;
-      }
-
-      const updatedJudge = currentUser?.role === 'juri' ? currentUser.name : targetParticipant.juri;
-      const updatedP: Participant = {
-        ...targetParticipant,
-        juri: updatedJudge,
-        scores: {
-          ...targetParticipant.scores,
-          [categoryKey]: currentCatScores
+      const syncRes = await saveParticipantToCloud(latestP);
+      if (!syncRes.success) {
+        if (syncRes.isQuotaError) {
+          setSaveSyncStatus('saved');
+          setCloudStatus('quota_paused');
+          const now = Date.now();
+          if (now - lastQuotaToastAtRef.current > 12000) {
+            lastQuotaToastAtRef.current = now;
+            showToast(
+              syncRes.backedUpToServer
+                ? 'Nilai diamankan di Cadangan Server & lokal (kuota Cloud harian penuh).'
+                : 'Nilai disimpan lokal (kuota tulis Cloud harian sedang penuh).',
+              'info'
+            );
+          }
+          return;
         }
-      };
 
-      setSavingCriterionKeys(prev => ({ ...prev, [rowKey]: true }));
-      setSaveSyncStatus('saving');
-      setWorkspaceErrorBanner(null);
+        if (syncRes.queuedOffline) {
+          setSaveSyncStatus('saved');
+          setCloudStatus('offline');
+          return;
+        }
 
-      // Keep ref & React state synchronized immediately for queued sibling updates
-      const nextList = pesertaListRef.current.map(p => (p.id === targetParticipantId ? updatedP : p));
-      pesertaListRef.current = nextList;
-      setPesertaList(nextList);
-
-      try {
-        const syncRes = await saveParticipantToCloud(updatedP);
-        if (!syncRes.success) {
-          if (syncRes.isQuotaError) {
-            // Keep local optimistic update safely in state & localStorage when Cloud daily write quota is exhausted
-            try {
-              localStorage.setItem(STORAGE_KEY, JSON.stringify({ pesertaList: pesertaListRef.current }));
-            } catch {
-              // ignore storage limit
-            }
-            setSaveSyncStatus('idle');
-            setCloudStatus('error');
-            showToast('Nilai disimpan secara lokal (Kuota tulis Cloud harian sedang penuh).', 'info');
-            return;
-          }
-
-          if (syncRes.queuedOffline) {
-            try {
-              localStorage.setItem(STORAGE_KEY, JSON.stringify({ pesertaList: pesertaListRef.current }));
-            } catch {
-              // ignore storage limit
-            }
-            setSaveSyncStatus('saved');
-            setCloudStatus('offline');
-            showToast('Nilai disimpan offline & otomatis dikirim ke Cloud saat online.', 'info');
-            return;
-          }
-
-          // Roll back ONLY this criterion on the latest participant snapshot for permission/payload failures
+        if (rollbackContext) {
+          const { categoryKey, criterionNo, previousVal } = rollbackContext;
           const rollbackList = pesertaListRef.current.map(p => {
             if (p.id !== targetParticipantId) return p;
             const revertedCat = { ...(p.scores?.[categoryKey] || {}) };
@@ -3119,41 +3790,109 @@ export default function App() {
           });
           pesertaListRef.current = rollbackList;
           setPesertaList(rollbackList);
-
-          setSaveSyncStatus('error');
-          setCloudStatus(syncRes.isNetworkError ? 'offline' : 'error');
-          setWorkspaceErrorBanner({
-            title: syncRes.isNetworkError
-              ? 'Gagal Menyimpan Nilai (Gangguan Jaringan)'
-              : 'Gagal Menyimpan Nilai ke Cloud',
-            message:
-              syncRes.error ||
-              'Terjadi kesalahan jaringan saat mengirim nilai ke Cloud. Perubahan belum tersinkron.',
-            isNetworkError: syncRes.isNetworkError,
-            onRetry: () => {
-              void executeScoreMutation(targetParticipantId, categoryKey, criterionNo, val);
-            }
-          });
-          showToast(syncRes.error || 'Gagal menyimpan nilai ke Cloud.', 'error');
-          return;
         }
 
-        setSaveSyncStatus('saved');
-        setCloudStatus('connected');
-        setCloudLastSynced(new Date());
-        showToast('Nilai tersimpan & tersinkron ke Cloud');
-      } finally {
-        setSavingCriterionKeys(prev => {
-          if (!prev[rowKey]) return prev;
-          const next = { ...prev };
-          delete next[rowKey];
-          return next;
+        setSaveSyncStatus('error');
+        setCloudStatus(resolveStatusFromCloudResult(syncRes));
+        setWorkspaceErrorBanner({
+          title: syncRes.isNetworkError
+            ? 'Gagal Menyimpan Nilai (Gangguan Jaringan)'
+            : 'Gagal Menyimpan Nilai ke Cloud',
+          message:
+            syncRes.error ||
+            'Terjadi kesalahan saat mengirim nilai ke Cloud. Perubahan tersimpan lokal.',
+          isNetworkError: syncRes.isNetworkError,
+          onRetry: () => {
+            void flushCoalescedScoreDelta(targetParticipantId, rollbackContext);
+          }
         });
+        showToast(syncRes.error || 'Gagal menyimpan nilai ke Cloud.', 'error');
+        return;
       }
+
+      // Clean any coalesced offline queue entry for this participant since Cloud now has latest state
+      removeOfflineMutation(`participant_save:${targetParticipantId}`);
+      setSaveSyncStatus('saved');
+      setCloudStatus('connected');
+      setCloudLastSynced(new Date());
     });
 
     scoreWriteQueueRef.current[targetParticipantId] = nextTask.catch(() => undefined);
     return nextTask;
+  };
+
+  flushPendingScoresRef.current = () => {
+    const ids = Array.from(pendingScoreParticipantIdsRef.current);
+    ids.forEach(pid => {
+      const t = scoreDebounceTimersRef.current[pid];
+      if (t) {
+        clearTimeout(t);
+        delete scoreDebounceTimersRef.current[pid];
+      }
+      void flushCoalescedScoreDelta(pid);
+    });
+  };
+
+  // Handle Score Selection (instant optimistic UI + coalesced delta sync to save Cloud write quota)
+  const executeScoreMutation = async (
+    targetParticipantId: string,
+    categoryKey: CategoryKey,
+    criterionNo: number,
+    val: number | null
+  ): Promise<void> => {
+    const targetParticipant = pesertaListRef.current.find(p => p.id === targetParticipantId);
+    if (!targetParticipant) return;
+
+    const previousVal = targetParticipant.scores?.[categoryKey]?.[criterionNo];
+    const currentCatScores = { ...(targetParticipant.scores?.[categoryKey] || {}) };
+    if (val === null) {
+      delete currentCatScores[criterionNo];
+    } else {
+      currentCatScores[criterionNo] = val;
+    }
+
+    const updatedJudge = currentUser?.role === 'juri' ? currentUser.name : targetParticipant.juri;
+    const updatedP: Participant = {
+      ...targetParticipant,
+      juri: updatedJudge,
+      scores: {
+        ...targetParticipant.scores,
+        [categoryKey]: currentCatScores
+      }
+    };
+
+    setSaveSyncStatus('saving');
+    setWorkspaceErrorBanner(null);
+
+    const nextList = pesertaListRef.current.map(p => (p.id === targetParticipantId ? updatedP : p));
+    pesertaListRef.current = nextList;
+    setPesertaList(nextList);
+
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ pesertaList: nextList }));
+    } catch {
+      // ignore storage quota errors
+    }
+
+    // Enqueue deduplicated delta mutation immediately so refreshes never lose edits
+    enqueueOfflineMutation('participant_save', targetParticipantId, {
+      ...updatedP,
+      updatedAt: new Date().toISOString()
+    });
+    pendingScoreParticipantIdsRef.current.add(targetParticipantId);
+
+    // Coalesce rapid criterion clicks per participant into a single Cloud + Server write (650ms window)
+    if (scoreDebounceTimersRef.current[targetParticipantId]) {
+      clearTimeout(scoreDebounceTimersRef.current[targetParticipantId]);
+    }
+    scoreDebounceTimersRef.current[targetParticipantId] = setTimeout(() => {
+      delete scoreDebounceTimersRef.current[targetParticipantId];
+      void flushCoalescedScoreDelta(targetParticipantId, {
+        categoryKey,
+        criterionNo,
+        previousVal
+      });
+    }, 650);
   };
 
   const handleScoreSelect = async (categoryKey: CategoryKey, criterionNo: number, val: number | null) => {
@@ -3176,9 +3915,9 @@ export default function App() {
 
     try {
       const syncRes = await saveParticipantToCloud(updatedP);
-      if (!syncRes.success && !syncRes.queuedOffline) {
+      if (!syncRes.success && !syncRes.queuedOffline && !syncRes.isQuotaError) {
         setSaveSyncStatus('error');
-        setCloudStatus(syncRes.isNetworkError ? 'offline' : 'error');
+        setCloudStatus(resolveStatusFromCloudResult(syncRes));
         setConfirmModal(prev => ({ ...prev, isOpen: false }));
         setWorkspaceErrorBanner({
           title: 'Gagal Mengosongkan Nilai di Cloud',
@@ -3194,15 +3933,15 @@ export default function App() {
       pesertaListRef.current = nextList;
       setPesertaList(nextList);
       setSaveSyncStatus('saved');
-      if (syncRes.queuedOffline) {
-        setCloudStatus('offline');
-      } else {
-        setCloudStatus('connected');
+      setCloudStatus(resolveStatusFromCloudResult(syncRes));
+      if (syncRes.success) {
         setCloudLastSynced(new Date());
       }
       setConfirmModal(prev => ({ ...prev, isOpen: false }));
       showToast(
-        syncRes.queuedOffline
+        syncRes.isQuotaError
+          ? `Reset nilai ${catName} diamankan di Cadangan Server & lokal (kuota Cloud penuh).`
+          : syncRes.queuedOffline
           ? `Reset nilai ${catName} disimpan offline & otomatis dikirim saat online.`
           : `Nilai ${catName} telah dikosongkan & disinkronkan ke Cloud.`,
         'info'
@@ -3379,9 +4118,9 @@ export default function App() {
 
     try {
       const syncRes = await saveParticipantToCloud(updatedP);
-      if (!syncRes.success && !syncRes.queuedOffline) {
+      if (!syncRes.success && !syncRes.queuedOffline && !syncRes.isQuotaError) {
         setSaveSyncStatus('error');
-        setCloudStatus(syncRes.isNetworkError ? 'offline' : 'error');
+        setCloudStatus(resolveStatusFromCloudResult(syncRes));
         setModalErrorBanner({
           title: syncRes.isNetworkError
             ? 'Gagal Menerapkan Nilai Scan (Gangguan Jaringan)'
@@ -3396,20 +4135,20 @@ export default function App() {
 
       setPesertaList(prev => prev.map(p => (p.id === updatedP.id ? updatedP : p)));
       setSaveSyncStatus('saved');
-      if (syncRes.queuedOffline) {
-        setCloudStatus('offline');
-      } else {
-        setCloudStatus('connected');
+      setCloudStatus(resolveStatusFromCloudResult(syncRes));
+      if (syncRes.success) {
         setCloudLastSynced(new Date());
       }
       setModalScanOpen(false);
       setScanPreviewUrl(null);
       setScannedResult(null);
       showToast(
-        syncRes.queuedOffline
+        syncRes.isQuotaError
+          ? `Nilai ${activeCategory.title} diamankan di Cadangan Server & lokal (kuota Cloud penuh).`
+          : syncRes.queuedOffline
           ? `Nilai ${activeCategory.title} disimpan offline & akan otomatis tersinkron saat online.`
           : `Nilai ${activeCategory.title} dari foto berhasil diterapkan & tersinkron ke Cloud!`,
-        syncRes.queuedOffline ? 'info' : 'success'
+        syncRes.queuedOffline || syncRes.isQuotaError ? 'info' : 'success'
       );
     } finally {
       setIsSavingScanScores(false);
@@ -3496,13 +4235,13 @@ export default function App() {
           scores: existing?.scores || {
             pbb: {}, danton: {},
             devile: {}, gatur: {}, senam: {}, yelyel: {},
-            beladiri: {}, speaking: {}, tenda: {}
+            beladiri: {}, speaking: {}, tenda: {}, cerdas_cermat: {}
           }
         };
 
         const syncRes = await saveParticipantToCloud(updatedParticipant);
-        if (!syncRes.success && !syncRes.queuedOffline) {
-          setCloudStatus(syncRes.isNetworkError ? 'offline' : 'error');
+        if (!syncRes.success && !syncRes.queuedOffline && !syncRes.isQuotaError) {
+          setCloudStatus(resolveStatusFromCloudResult(syncRes));
           setModalErrorBanner({
             title: syncRes.isNetworkError
               ? 'Gagal Memperbarui Peserta (Gangguan Jaringan)'
@@ -3522,17 +4261,17 @@ export default function App() {
         } catch {
           // ignore
         }
-        if (syncRes.queuedOffline) {
-          setCloudStatus('offline');
-        } else {
-          setCloudStatus('connected');
+        setCloudStatus(resolveStatusFromCloudResult(syncRes));
+        if (syncRes.success) {
           setCloudLastSynced(new Date());
         }
         showToast(
-          syncRes.queuedOffline
+          syncRes.isQuotaError
+            ? 'Data peserta diamankan di Cadangan Server & lokal (kuota Cloud penuh).'
+            : syncRes.queuedOffline
             ? 'Data peserta disimpan offline & otomatis dikirim ke Cloud saat online.'
             : 'Data peserta berhasil diperbarui & tersinkron otomatis ke Cloud!',
-          syncRes.queuedOffline ? 'info' : 'success'
+          syncRes.queuedOffline || syncRes.isQuotaError ? 'info' : 'success'
         );
       } else {
         const newId = 'p-' + Date.now();
@@ -3553,13 +4292,14 @@ export default function App() {
             yelyel: {},
             beladiri: {},
             speaking: {},
-            tenda: {}
+            tenda: {},
+            cerdas_cermat: {}
           }
         };
 
         const syncRes = await saveParticipantToCloud(newParticipant);
-        if (!syncRes.success && !syncRes.queuedOffline) {
-          setCloudStatus(syncRes.isNetworkError ? 'offline' : 'error');
+        if (!syncRes.success && !syncRes.queuedOffline && !syncRes.isQuotaError) {
+          setCloudStatus(resolveStatusFromCloudResult(syncRes));
           setModalErrorBanner({
             title: syncRes.isNetworkError
               ? 'Gagal Menambah Peserta Baru (Gangguan Jaringan)'
@@ -3580,17 +4320,17 @@ export default function App() {
         } catch {
           // ignore
         }
-        if (syncRes.queuedOffline) {
-          setCloudStatus('offline');
-        } else {
-          setCloudStatus('connected');
+        setCloudStatus(resolveStatusFromCloudResult(syncRes));
+        if (syncRes.success) {
           setCloudLastSynced(new Date());
         }
         showToast(
-          syncRes.queuedOffline
+          syncRes.isQuotaError
+            ? `Peserta baru "${newParticipant.peleton || newParticipant.sekolah}" diamankan di Cadangan Server & lokal (kuota Cloud penuh).`
+            : syncRes.queuedOffline
             ? `Peserta baru "${newParticipant.peleton || newParticipant.sekolah}" disimpan offline & otomatis dikirim saat online.`
             : `Peserta baru "${newParticipant.peleton || newParticipant.sekolah}" berhasil ditambahkan & tersinkron otomatis ke Cloud!`,
-          syncRes.queuedOffline ? 'info' : 'success'
+          syncRes.queuedOffline || syncRes.isQuotaError ? 'info' : 'success'
         );
       }
       setModalPesertaOpen(false);
@@ -3608,8 +4348,8 @@ export default function App() {
     setConfirmLoading(true);
     try {
       const res = await deleteParticipantFromCloud(id);
-      if (!res.success && !res.queuedOffline) {
-        setCloudStatus(res.isNetworkError ? 'offline' : 'error');
+      if (!res.success && !res.queuedOffline && !res.isQuotaError) {
+        setCloudStatus(resolveStatusFromCloudResult(res));
         setConfirmModal(prev => ({ ...prev, isOpen: false }));
         setWorkspaceErrorBanner({
           title: 'Gagal Menghapus Peserta di Cloud',
@@ -3631,16 +4371,16 @@ export default function App() {
       } catch {
         // ignore
       }
-      if (res.queuedOffline) {
-        setCloudStatus('offline');
-      } else {
-        setCloudStatus('connected');
+      setCloudStatus(resolveStatusFromCloudResult(res));
+      if (res.success) {
         setCloudLastSynced(new Date());
       }
       setWorkspaceErrorBanner(null);
       setConfirmModal(prev => ({ ...prev, isOpen: false }));
       showToast(
-        res.queuedOffline
+        res.isQuotaError
+          ? 'Penghapusan peserta diamankan di Cadangan Server & antrean delta (kuota Cloud penuh).'
+          : res.queuedOffline
           ? 'Penghapusan peserta disimpan offline & otomatis dikirim ke Cloud saat online.'
           : 'Peserta berhasil dihapus dari Cloud & lokal.',
         'info'
@@ -3678,11 +4418,16 @@ export default function App() {
       const initialIds = new Set(INITIAL_PESERTA.map(p => p.id));
       const toDelete = pesertaListRef.current.filter(p => !initialIds.has(p.id));
 
+      let hasQuotaPause = false;
+      let hasOfflineQueue = false;
+
       for (const item of toDelete) {
         const delRes = await deleteParticipantFromCloud(item.id);
-        if (!delRes.success) {
+        if (delRes.isQuotaError) hasQuotaPause = true;
+        else if (delRes.queuedOffline) hasOfflineQueue = true;
+        else if (!delRes.success) {
           setSaveSyncStatus('error');
-          setCloudStatus(delRes.isNetworkError ? 'offline' : 'error');
+          setCloudStatus(resolveStatusFromCloudResult(delRes));
           setConfirmModal(prev => ({ ...prev, isOpen: false }));
           setWorkspaceErrorBanner({
             title: 'Gagal Mereset Semua Data di Cloud',
@@ -3697,9 +4442,11 @@ export default function App() {
 
       for (const baseItem of INITIAL_PESERTA) {
         const saveRes = await saveParticipantToCloud(baseItem);
-        if (!saveRes.success) {
+        if (saveRes.isQuotaError) hasQuotaPause = true;
+        else if (saveRes.queuedOffline) hasOfflineQueue = true;
+        else if (!saveRes.success) {
           setSaveSyncStatus('error');
-          setCloudStatus(saveRes.isNetworkError ? 'offline' : 'error');
+          setCloudStatus(resolveStatusFromCloudResult(saveRes));
           setConfirmModal(prev => ({ ...prev, isOpen: false }));
           setWorkspaceErrorBanner({
             title: 'Gagal Memulihkan Data Awal ke Cloud',
@@ -3721,10 +4468,21 @@ export default function App() {
       setPesertaList(INITIAL_PESERTA);
       setActivePesertaId(INITIAL_PESERTA[0]?.id || null);
       setSaveSyncStatus('saved');
-      setCloudStatus('connected');
-      setCloudLastSynced(new Date());
+      if (hasQuotaPause) {
+        setCloudStatus('quota_paused');
+      } else if (hasOfflineQueue) {
+        setCloudStatus('offline');
+      } else {
+        setCloudStatus('connected');
+        setCloudLastSynced(new Date());
+      }
       setConfirmModal(prev => ({ ...prev, isOpen: false }));
-      showToast('Basis data Cloud & lokal telah direset ke setelan awal.', 'info');
+      showToast(
+        hasQuotaPause
+          ? 'Basis data direset lokal & diamankan ke Cadangan Server (kuota Cloud penuh).'
+          : 'Basis data Cloud & lokal telah direset ke setelan awal.',
+        'info'
+      );
     } finally {
       setConfirmLoading(false);
     }
@@ -3756,6 +4514,8 @@ export default function App() {
     registrationsList,
     paymentConfig,
     blankoConfig,
+    cerdasCermatConfig,
+    cerdasCermatSubmissions,
     appStatus
   });
 
@@ -3781,41 +4541,53 @@ export default function App() {
       );
       setPesertaList(normalizedPeserta);
       let hasSyncError = false;
+      let hasQuotaPause = false;
+      let hasOfflineQueue = false;
+
+      const recordSyncStatus = (r: CloudWriteResult) => {
+        if (r.isQuotaError) hasQuotaPause = true;
+        else if (r.queuedOffline) hasOfflineQueue = true;
+        else if (!r.success) hasSyncError = true;
+      };
 
       for (const p of normalizedPeserta) {
-        const res = await saveParticipantToCloud(p);
-        if (!res.success && !res.queuedOffline) hasSyncError = true;
+        recordSyncStatus(await saveParticipantToCloud(p));
       }
       if (Array.isArray(parsed.categories)) {
         const normalizedCats = normalizeCategoriesConfig(parsed.categories).categories;
         setCategories(normalizedCats);
         setTempCategoriesConfig(normalizedCats);
-        const cfgRes = await saveConfigToCloud(normalizedCats);
-        if (!cfgRes.success && !cfgRes.queuedOffline) hasSyncError = true;
+        recordSyncStatus(await saveConfigToCloud(normalizedCats));
       }
       if (Array.isArray(parsed.usersList)) {
         setUsersList(parsed.usersList);
         for (const u of parsed.usersList) {
-          const uRes = await saveUserToCloud(u);
-          if (!uRes.success && !uRes.queuedOffline) hasSyncError = true;
+          recordSyncStatus(await saveUserToCloud(u));
         }
       }
       if (Array.isArray(parsed.registrationsList)) {
         setRegistrationsList(parsed.registrationsList);
         for (const r of parsed.registrationsList) {
-          const rRes = await saveRegistrationToCloud(r);
-          if (!rRes.success && !rRes.queuedOffline) hasSyncError = true;
+          recordSyncStatus(await saveRegistrationToCloud(r));
         }
       }
       if (parsed.paymentConfig && typeof parsed.paymentConfig === 'object') {
         setPaymentConfig(parsed.paymentConfig);
-        const pRes = await savePaymentConfigToCloud(parsed.paymentConfig);
-        if (!pRes.success && !pRes.queuedOffline) hasSyncError = true;
+        recordSyncStatus(await savePaymentConfigToCloud(parsed.paymentConfig));
       }
       if (parsed.blankoConfig && typeof parsed.blankoConfig === 'object') {
         setBlankoConfig(parsed.blankoConfig);
-        const bRes = await saveBlankoConfigToCloud(parsed.blankoConfig);
-        if (!bRes.success && !bRes.queuedOffline) hasSyncError = true;
+        recordSyncStatus(await saveBlankoConfigToCloud(parsed.blankoConfig));
+      }
+      if (parsed.cerdasCermatConfig && typeof parsed.cerdasCermatConfig === 'object') {
+        setCerdasCermatConfig(parsed.cerdasCermatConfig);
+        recordSyncStatus(await saveCerdasCermatConfigToCloud(parsed.cerdasCermatConfig));
+      }
+      if (Array.isArray(parsed.cerdasCermatSubmissions)) {
+        setCerdasCermatSubmissions(parsed.cerdasCermatSubmissions);
+        for (const ccSub of parsed.cerdasCermatSubmissions) {
+          recordSyncStatus(await saveCerdasCermatSubmissionToCloud(ccSub));
+        }
       }
       if (normalizedPeserta.length > 0) {
         setActivePesertaId(normalizedPeserta[0].id);
@@ -3823,12 +4595,16 @@ export default function App() {
       if (hasSyncError) {
         setCloudStatus(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'error');
         showToast('Data dipulihkan lokal, sebagian sinkronisasi Cloud gagal.', 'error');
+      } else if (hasQuotaPause) {
+        setCloudStatus('quota_paused');
+        showToast('Data dipulihkan & diamankan ke Cadangan Server + antrean delta (kuota Cloud penuh).', 'info');
+      } else if (hasOfflineQueue) {
+        setCloudStatus('offline');
+        showToast('Data dipulihkan & diantrekan offline untuk sinkronisasi otomatis saat online.', 'info');
       } else {
-        setCloudStatus(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'connected');
-        if (typeof navigator === 'undefined' || navigator.onLine) {
-          setCloudLastSynced(new Date());
-        }
-        showToast('Data cadangan berhasil dipulihkan!');
+        setCloudStatus('connected');
+        setCloudLastSynced(new Date());
+        showToast('Data cadangan berhasil dipulihkan & disinkronkan!');
       }
     } finally {
       setIsRestoringBackup(false);
@@ -3952,8 +4728,8 @@ export default function App() {
     setIsSavingConfig(true);
     try {
       const syncRes = await saveConfigToCloud(tempCategoriesConfig);
-      if (!syncRes.success && !syncRes.queuedOffline) {
-        setCloudStatus(syncRes.isNetworkError ? 'offline' : 'error');
+      if (!syncRes.success && !syncRes.queuedOffline && !syncRes.isQuotaError) {
+        setCloudStatus(resolveStatusFromCloudResult(syncRes));
         setModalErrorBanner({
           title: syncRes.isNetworkError
             ? 'Gagal Menyimpan Juknis (Gangguan Jaringan)'
@@ -3967,18 +4743,18 @@ export default function App() {
       }
 
       setCategories(tempCategoriesConfig);
-      if (syncRes.queuedOffline) {
-        setCloudStatus('offline');
-      } else {
-        setCloudStatus('connected');
+      setCloudStatus(resolveStatusFromCloudResult(syncRes));
+      if (syncRes.success) {
         setCloudLastSynced(new Date());
       }
       setModalConfigOpen(false);
       showToast(
-        syncRes.queuedOffline
+        syncRes.isQuotaError
+          ? 'Konfigurasi juknis diamankan di Cadangan Server & lokal (kuota Cloud penuh).'
+          : syncRes.queuedOffline
           ? 'Konfigurasi juknis disimpan offline & otomatis dikirim saat online.'
           : 'Ketentuan nilai maksimal juknis berhasil diperbarui & tersinkron ke Cloud!',
-        syncRes.queuedOffline ? 'info' : 'success'
+        syncRes.queuedOffline || syncRes.isQuotaError ? 'info' : 'success'
       );
     } finally {
       setIsSavingConfig(false);
@@ -4000,8 +4776,8 @@ export default function App() {
     setIsSavingConfig(true);
     try {
       const syncRes = await saveConfigToCloud(DEFAULT_CATEGORIES);
-      if (!syncRes.success && !syncRes.queuedOffline) {
-        setCloudStatus(syncRes.isNetworkError ? 'offline' : 'error');
+      if (!syncRes.success && !syncRes.queuedOffline && !syncRes.isQuotaError) {
+        setCloudStatus(resolveStatusFromCloudResult(syncRes));
         setModalErrorBanner({
           title: 'Gagal Mengembalikan Juknis Standar di Cloud',
           message: syncRes.error || 'Terjadi gangguan jaringan saat mereset juknis.',
@@ -4013,14 +4789,14 @@ export default function App() {
       }
       setTempCategoriesConfig(DEFAULT_CATEGORIES);
       setCategories(DEFAULT_CATEGORIES);
-      if (syncRes.queuedOffline) {
-        setCloudStatus('offline');
-      } else {
-        setCloudStatus('connected');
+      setCloudStatus(resolveStatusFromCloudResult(syncRes));
+      if (syncRes.success) {
         setCloudLastSynced(new Date());
       }
       showToast(
-        syncRes.queuedOffline
+        syncRes.isQuotaError
+          ? 'Reset juknis diamankan di Cadangan Server & antrean delta (kuota Cloud penuh).'
+          : syncRes.queuedOffline
           ? 'Reset juknis disimpan offline & otomatis dikirim saat online.'
           : 'Konfigurasi dikembalikan ke standar awal & tersinkron ke Cloud.',
         'info'
@@ -4262,12 +5038,19 @@ export default function App() {
     return result;
   }, [pesertaList, categories]);
 
-  // 2. Klasemen Juara Umum (Akumulasi Semua Kategori) + Rincian Peringkat Tiap Kategori
+  // 2. Klasemen Juara Umum (Berdasarkan Perolehan Tropi Juara 1 Terbanyak, Tie-Breaker: Juara 2 -> Juara 3 -> Total Poin)
   const overallStandingsData = useMemo(() => {
     const list = pesertaList.map(p => {
       const calc = calculateAllCategories(p, categories)!;
       // Ambil peringkat mandiri peserta ini di setiap kategori
       const catRanks: Record<CategoryKey, { rank: number | null; jenjangRank: number | null; sum: number; isComplete: boolean; hasScored: boolean }> = {} as any;
+      let jenjangJ1 = 0;
+      let jenjangJ2 = 0;
+      let jenjangJ3 = 0;
+      let combinedJ1 = 0;
+      let combinedJ2 = 0;
+      let combinedJ3 = 0;
+
       categories.forEach(cat => {
         const catInfo = allCategoriesRankings[cat.key];
         const r = catInfo?.rankMap.get(p.id) || null;
@@ -4276,47 +5059,100 @@ export default function App() {
         const isComplete = calc.categorySummaries[cat.key]?.isComplete || false;
         const hasScored = calc.categorySummaries[cat.key]?.hasScored || false;
         catRanks[cat.key] = { rank: r, jenjangRank: jr, sum, isComplete, hasScored };
+
+        if (hasScored && jr !== null) {
+          if (jr === 1) jenjangJ1 += 1;
+          else if (jr === 2) jenjangJ2 += 1;
+          else if (jr === 3) jenjangJ3 += 1;
+        }
+        if (hasScored && r !== null) {
+          if (r === 1) combinedJ1 += 1;
+          else if (r === 2) combinedJ2 += 1;
+          else if (r === 3) combinedJ3 += 1;
+        }
       });
 
       return {
         ...p,
         calc,
         catRanks,
+        trophyCounts: {
+          juara1: jenjangJ1,
+          juara2: jenjangJ2,
+          juara3: jenjangJ3,
+          totalTrophies: jenjangJ1 + jenjangJ2 + jenjangJ3
+        },
+        overallTrophyCounts: {
+          juara1: combinedJ1,
+          juara2: combinedJ2,
+          juara3: combinedJ3,
+          totalTrophies: combinedJ1 + combinedJ2 + combinedJ3
+        },
         rank: null as number | null,
         jenjangRank: null as number | null
       };
     });
 
+    const compareByCombinedTrophies = (a: typeof list[number], b: typeof list[number]) => {
+      if (b.overallTrophyCounts.juara1 !== a.overallTrophyCounts.juara1) {
+        return b.overallTrophyCounts.juara1 - a.overallTrophyCounts.juara1;
+      }
+      if (b.overallTrophyCounts.juara2 !== a.overallTrophyCounts.juara2) {
+        return b.overallTrophyCounts.juara2 - a.overallTrophyCounts.juara2;
+      }
+      if (b.overallTrophyCounts.juara3 !== a.overallTrophyCounts.juara3) {
+        return b.overallTrophyCounts.juara3 - a.overallTrophyCounts.juara3;
+      }
+      return b.calc.grandTotal - a.calc.grandTotal;
+    };
+
+    const compareByJenjangTrophies = (a: typeof list[number], b: typeof list[number]) => {
+      if (b.trophyCounts.juara1 !== a.trophyCounts.juara1) {
+        return b.trophyCounts.juara1 - a.trophyCounts.juara1;
+      }
+      if (b.trophyCounts.juara2 !== a.trophyCounts.juara2) {
+        return b.trophyCounts.juara2 - a.trophyCounts.juara2;
+      }
+      if (b.trophyCounts.juara3 !== a.trophyCounts.juara3) {
+        return b.trophyCounts.juara3 - a.trophyCounts.juara3;
+      }
+      return b.calc.grandTotal - a.calc.grandTotal;
+    };
+
     // Peringkat Juara Umum (Gabungan) — minimal 1 poin terisi sudah masuk peringkat
     const qualifiedList = list
       .filter(item => item.calc.hasAnyScore)
-      .sort((a, b) => b.calc.grandTotal - a.calc.grandTotal);
+      .sort(compareByCombinedTrophies);
 
     let rankCounter = 1;
     for (let i = 0; i < qualifiedList.length; i++) {
-      if (i > 0 && qualifiedList[i].calc.grandTotal < qualifiedList[i - 1].calc.grandTotal) {
+      if (i > 0 && compareByCombinedTrophies(qualifiedList[i - 1], qualifiedList[i]) !== 0) {
         rankCounter = i + 1;
       }
       qualifiedList[i].rank = rankCounter;
     }
 
     const rankMap = new Map<string, number>();
-    qualifiedList.forEach((c: any) => rankMap.set(c.id, c.rank));
+    qualifiedList.forEach(c => rankMap.set(c.id, c.rank!));
 
-    // Peringkat Juara Umum Khusus Jenjang (SLTP dan SLTA Mandiri)
-    const sltpQualified = qualifiedList.filter(item => (item.jenjang || 'SLTP') === 'SLTP');
+    // Peringkat Juara Umum Khusus Jenjang (SLTP dan SLTA Mandiri) berdasarkan Tropi Juara 1 terbanyak
+    const sltpQualified = list
+      .filter(item => item.calc.hasAnyScore && (item.jenjang || 'SLTP') === 'SLTP')
+      .sort(compareByJenjangTrophies);
     let sltpR = 1;
     for (let i = 0; i < sltpQualified.length; i++) {
-      if (i > 0 && sltpQualified[i].calc.grandTotal < sltpQualified[i - 1].calc.grandTotal) {
+      if (i > 0 && compareByJenjangTrophies(sltpQualified[i - 1], sltpQualified[i]) !== 0) {
         sltpR = i + 1;
       }
       sltpQualified[i].jenjangRank = sltpR;
     }
 
-    const sltaQualified = qualifiedList.filter(item => item.jenjang === 'SLTA');
+    const sltaQualified = list
+      .filter(item => item.calc.hasAnyScore && item.jenjang === 'SLTA')
+      .sort(compareByJenjangTrophies);
     let sltaR = 1;
     for (let i = 0; i < sltaQualified.length; i++) {
-      if (i > 0 && sltaQualified[i].calc.grandTotal < sltaQualified[i - 1].calc.grandTotal) {
+      if (i > 0 && compareByJenjangTrophies(sltaQualified[i - 1], sltaQualified[i]) !== 0) {
         sltaR = i + 1;
       }
       sltaQualified[i].jenjangRank = sltaR;
@@ -4405,7 +5241,11 @@ export default function App() {
         'Nama Peleton': item.peleton || '-',
         'Nama Sekolah': item.sekolah,
         'Hari / Tanggal': item.tanggal,
-        'Nama Juri': item.juri
+        'Nama Juri': item.juri,
+        'Tropi Juara 1': item.trophyCounts.juara1,
+        'Tropi Juara 2': item.trophyCounts.juara2,
+        'Tropi Juara 3': item.trophyCounts.juara3,
+        'Total Tropi (1-3)': item.trophyCounts.totalTrophies
       };
 
       categories.forEach(cat => {
@@ -4951,24 +5791,25 @@ export default function App() {
     return {
       ...target,
       calc,
-      rank: itemInTable?.rank || null
+      rank: itemInTable?.jenjangRank || itemInTable?.rank || null,
+      trophyCounts: itemInTable?.trophyCounts || { juara1: 0, juara2: 0, juara3: 0, totalTrophies: 0 }
     };
   }, [printPesertaId, scopedPesertaList, categories, overallStandingsData]);
 
-  // Navigate between categories (Next / Prev)
+  // Navigate between field scoring categories (Next / Prev)
   const currentCategoryIndex = useMemo(() => {
-    return categories.findIndex(c => c.key === currentTab);
-  }, [categories, currentTab]);
+    return scoringCategories.findIndex(c => c.key === currentTab);
+  }, [scoringCategories, currentTab]);
 
   const handlePrevCategory = () => {
     if (currentCategoryIndex > 0) {
-      setCurrentTab(categories[currentCategoryIndex - 1].key);
+      setCurrentTab(scoringCategories[currentCategoryIndex - 1].key);
     }
   };
 
   const handleNextCategory = () => {
-    if (currentCategoryIndex >= 0 && currentCategoryIndex < categories.length - 1) {
-      setCurrentTab(categories[currentCategoryIndex + 1].key);
+    if (currentCategoryIndex >= 0 && currentCategoryIndex < scoringCategories.length - 1) {
+      setCurrentTab(scoringCategories[currentCategoryIndex + 1].key);
     }
   };
 
@@ -5405,38 +6246,35 @@ export default function App() {
                 type="button"
                 onClick={() => setModalCloudInfoOpen(true)}
                 title={
-                  cloudQuotaExceeded
-                    ? 'Kuota tulis harian Cloud Firestore tercapai (disimpan lokal hingga esok hari)'
-                    : 'Status Sinkronisasi Cloud Firestore Multi-Perangkat'
+                  cloudQuotaExceeded || cloudStatus === 'quota_paused'
+                    ? 'Mode Hemat Kuota · Perubahan diamankan di Cadangan Server & perangkat'
+                    : 'Status Sinkronisasi Delta Cloud & Cadangan Server'
                 }
-                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-bold border transition cursor-pointer shrink-0 ${
-                  cloudQuotaExceeded
+                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-bold border transition cursor-pointer shrink-0 whitespace-nowrap ${
+                  cloudQuotaExceeded || cloudStatus === 'quota_paused'
                     ? 'bg-amber-950/80 border-amber-500/50 text-amber-300 hover:bg-amber-900/60'
                     : cloudStatus === 'connected'
                     ? 'bg-emerald-950/70 border-emerald-500/40 text-emerald-300 hover:bg-emerald-900/60'
                     : cloudStatus === 'connecting'
-                    ? 'bg-amber-950/70 border-amber-500/40 text-amber-300 animate-pulse'
+                    ? 'bg-amber-950/70 border-amber-500/40 text-amber-300'
+                    : cloudStatus === 'offline'
+                    ? 'bg-slate-800 border-slate-600 text-slate-300'
                     : 'bg-rose-950/70 border-rose-500/40 text-rose-300'
                 }`}
               >
-                <span className={`w-2 h-2 rounded-full shrink-0 ${
-                  cloudQuotaExceeded
-                    ? 'bg-amber-400'
-                    : cloudStatus === 'connected'
-                    ? 'bg-emerald-400 animate-pulse'
-                    : cloudStatus === 'connecting'
-                    ? 'bg-amber-400'
-                    : 'bg-rose-400'
-                }`} />
                 <Cloud className="w-3.5 h-3.5 text-current shrink-0" />
                 <span className="hidden md:inline">
-                  {cloudQuotaExceeded
-                    ? 'Kuota Penuh'
+                  {cloudQuotaExceeded || cloudStatus === 'quota_paused'
+                    ? serverBackupStatus.available
+                      ? 'Cadangan Server'
+                      : 'Hemat Kuota'
                     : cloudStatus === 'connected'
                     ? 'Cloud Aktif'
                     : cloudStatus === 'connecting'
                     ? 'Menghubungkan...'
-                    : 'Offline'}
+                    : cloudStatus === 'offline'
+                    ? 'Offline'
+                    : 'Perlu Cek'}
                 </span>
               </button>
 
@@ -5611,14 +6449,14 @@ export default function App() {
                   {!sidebarCollapsed && (
                     <div className="text-left truncate">
                       <span className="block font-bold text-white text-xs">Kategori Penilaian</span>
-                      <span className="text-[10px] text-slate-400 font-normal">{categories.length} Mata Lomba</span>
+                      <span className="text-[10px] text-slate-400 font-normal">{scoringCategories.length} Mata Lomba</span>
                     </div>
                   )}
                 </div>
                 {!sidebarCollapsed && (
                   <div className="flex items-center gap-1.5 shrink-0">
                     <span className="text-[10px] font-bold bg-slate-800 text-blue-300 px-1.5 py-0.5 rounded tabular-nums">
-                      {activeCalc?.completedCategoriesCount || 0}/{categories.length}
+                      {scoringCategories.filter(c => activeCalc?.categorySummaries[c.key]?.isComplete).length}/{scoringCategories.length}
                     </span>
                     {sidebarCatDropdownOpen ? (
                       <ChevronUp className="w-3.5 h-3.5 text-slate-400" />
@@ -5636,7 +6474,7 @@ export default function App() {
                       <div className="text-[10px] uppercase font-black tracking-wider text-slate-500 px-2 pt-2">
                         {groupName}
                       </div>
-                      {categories.filter(c => c.group === groupName).map(cat => {
+                      {scoringCategories.filter(c => c.group === groupName).map(cat => {
                         const isDone = activeCalc?.categorySummaries[cat.key]?.isComplete;
                         const score = activeCalc?.categorySummaries[cat.key]?.sum || 0;
                         const isCurrent = currentTab === cat.key;
@@ -5675,8 +6513,120 @@ export default function App() {
             )}
 
             {/* ---------------------------------------------------- */}
-            {/* DROPDOWN 2: NAMA SEKOLAH & PANGKALAN KONTINGEN */}
+            {/* MENU: PROFILE SEKOLAH (LENGKAP & MANDIRI)            */}
             {/* ---------------------------------------------------- */}
+            <div className="bg-slate-950/40 rounded-xl border border-slate-800/80 overflow-hidden">
+              <button
+                type="button"
+                onClick={() => {
+                  setCurrentTab('profil_sekolah');
+                  setSidebarOpen(false);
+                }}
+                className={`w-full flex items-center justify-between p-2.5 text-xs font-bold transition cursor-pointer ${
+                  currentTab === 'profil_sekolah'
+                    ? 'bg-emerald-600 text-white shadow-md'
+                    : 'text-slate-200 hover:bg-slate-800/60'
+                }`}
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <div className={`p-1.5 rounded-lg shrink-0 ${
+                    currentTab === 'profil_sekolah' ? 'bg-white/20 text-white' : 'bg-emerald-500/15 text-emerald-400'
+                  }`}>
+                    <Building2 className="w-4 h-4" />
+                  </div>
+                  {!sidebarCollapsed && (
+                    <div className="text-left truncate">
+                      <span className="block font-bold text-white text-xs">Profile Sekolah</span>
+                      <span className={`text-[10px] font-normal ${currentTab === 'profil_sekolah' ? 'text-emerald-100' : 'text-slate-400'}`}>
+                        {isSekolahAccount ? 'Lengkapi Data Sekolah' : 'Direktori Profil Pangkalan'}
+                      </span>
+                    </div>
+                  )}
+                </div>
+                {!sidebarCollapsed && (
+                  <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded tabular-nums shrink-0 ${
+                    currentTab === 'profil_sekolah' ? 'bg-emerald-700 text-white' : 'bg-slate-800 text-emerald-300'
+                  }`}>
+                    {isSekolahAccount
+                      ? `${computeSchoolProfileCompleteness(currentUser).percent}%`
+                      : usersList.filter(u => u.role === 'sekolah').length}
+                  </span>
+                )}
+              </button>
+            </div>
+
+            {/* ---------------------------------------------------- */}
+            {/* MENU KHUSUS AKUN SEKOLAH: LOMBA CERDAS CERMAT       */}
+            {/* ---------------------------------------------------- */}
+            {isSekolahAccount && (() => {
+              const mySchoolSub = cerdasCermatSubmissions.find(
+                s => s.schoolUsername?.toLowerCase() === currentUser?.username?.toLowerCase()
+              );
+              return (
+                <div className="bg-slate-950/40 rounded-xl border border-slate-800/80 overflow-hidden">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCurrentTab('cerdas_cermat_sekolah');
+                      setSidebarOpen(false);
+                    }}
+                    className={`w-full flex items-center justify-between p-2.5 text-xs font-bold transition cursor-pointer ${
+                      currentTab === 'cerdas_cermat_sekolah'
+                        ? 'bg-indigo-600 text-white shadow-md'
+                        : 'text-slate-200 hover:bg-slate-800/60'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <div className={`p-1.5 rounded-lg shrink-0 ${
+                        currentTab === 'cerdas_cermat_sekolah'
+                          ? 'bg-white/20 text-white'
+                          : 'bg-indigo-500/15 text-indigo-400'
+                      }`}>
+                        <BookOpen className="w-4 h-4" />
+                      </div>
+                      {!sidebarCollapsed && (
+                        <div className="text-left truncate">
+                          <span className="block font-bold text-white text-xs">Lomba Cerdas Cermat</span>
+                          <span className={`text-[10px] font-normal ${currentTab === 'cerdas_cermat_sekolah' ? 'text-indigo-100' : 'text-slate-400'}`}>
+                            {mySchoolSub?.status === 'graded'
+                              ? 'Nilai Resmi Sudah Rilis'
+                              : mySchoolSub?.status === 'submitted'
+                              ? 'Menunggu Penilaian Admin'
+                              : cerdasCermatConfig.isOpen
+                              ? 'Jawab Soal Lomba'
+                              : 'Form Ditutup'}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                    {!sidebarCollapsed && (
+                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 ${
+                        mySchoolSub?.status === 'graded'
+                          ? 'bg-emerald-500/20 text-emerald-300'
+                          : mySchoolSub?.status === 'submitted'
+                          ? 'bg-amber-500/20 text-amber-300'
+                          : cerdasCermatConfig.isOpen
+                          ? 'bg-indigo-500/25 text-indigo-200'
+                          : 'bg-slate-800 text-slate-400'
+                      }`}>
+                        {mySchoolSub?.status === 'graded'
+                          ? `${mySchoolSub.totalScore} pt`
+                          : mySchoolSub?.status === 'submitted'
+                          ? 'Terkirim'
+                          : cerdasCermatConfig.isOpen
+                          ? 'Buka'
+                          : 'Tutup'}
+                      </span>
+                    )}
+                  </button>
+                </div>
+              );
+            })()}
+
+            {/* ---------------------------------------------------- */}
+            {/* DROPDOWN 2 (NON-SEKOLAH): KONTINGEN & PESERTA LOMBA  */}
+            {/* ---------------------------------------------------- */}
+            {!isSekolahAccount && (
             <div className="bg-slate-950/40 rounded-xl border border-slate-800/80 overflow-hidden">
               <button
                 type="button"
@@ -5685,19 +6635,19 @@ export default function App() {
                 className="w-full flex items-center justify-between p-2.5 text-xs font-bold text-slate-200 hover:bg-slate-800/60 transition cursor-pointer"
               >
                 <div className="flex items-center gap-2 min-w-0">
-                  <div className="p-1.5 rounded-lg bg-emerald-500/15 text-emerald-400 shrink-0">
-                    <Building2 className="w-4 h-4" />
+                  <div className="p-1.5 rounded-lg bg-blue-500/15 text-blue-400 shrink-0">
+                    <Users className="w-4 h-4" />
                   </div>
                   {!sidebarCollapsed && (
                     <div className="text-left truncate">
-                      <span className="block font-bold text-white text-xs">Nama Sekolah</span>
-                      <span className="text-[10px] text-slate-400 font-normal">Daftar Pangkalan & Kontingen</span>
+                      <span className="block font-bold text-white text-xs">Kontingen Lomba</span>
+                      <span className="text-[10px] text-slate-400 font-normal">Pilih Peserta Penilaian</span>
                     </div>
                   )}
                 </div>
                 {!sidebarCollapsed && (
                   <div className="flex items-center gap-1.5 shrink-0">
-                    <span className="text-[10px] font-bold bg-slate-800 text-emerald-300 px-1.5 py-0.5 rounded">
+                    <span className="text-[10px] font-bold bg-slate-800 text-blue-300 px-1.5 py-0.5 rounded">
                       {scopedPesertaList.length}
                     </span>
                     {sidebarPesertaDropdownOpen ? (
@@ -5830,6 +6780,7 @@ export default function App() {
                 </div>
               )}
             </div>
+            )}
 
             {/* ---------------------------------------------------- */}
             {/* DROPDOWN 3: REKAPITULASI & PERINGKAT */}
@@ -6102,190 +7053,497 @@ export default function App() {
               </button>
             </div>
 
-            {/* Menu Alat & Master Blanko Juri */}
-            <div className="pt-2 border-t border-slate-800 space-y-1">
-              {!isPembinaPolresRole && !isSekolahAccount && (
-                <button
-                  onClick={() => {
-                    setBlankSheetCatKey('pbb');
-                    setModalBlankSheetOpen(true);
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition cursor-pointer"
-                >
-                  <Printer className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                  {!sidebarCollapsed && <span className="truncate">Format Blanko Juri Penilaian</span>}
-                </button>
-              )}
+            {/* ---------------------------------------------------- */}
+            {/* MENU TERKATEGORI: PENDAFTARAN, LOMBA, AKUN, SISTEM   */}
+            {/* ---------------------------------------------------- */}
+            {(!isSekolahAccount || isAdminRole || isPembinaPolresRole || isSuperAdmin) && (() => {
+              const showPendaftaranGroup = isAdminRole || isPembinaPolresRole;
+              const showLombaGroup = (!isPembinaPolresRole && !isSekolahAccount) || isAdminRole || isSuperAdmin;
+              const showAkunGroup = isAdminRole;
+              const showSistemGroup = isAdminRole || isSuperAdmin;
+              const pendingCC = cerdasCermatSubmissions.filter(s => s.status === 'submitted').length;
+              const lombaMenuCount =
+                (isAdminRole ? 1 : 0) +
+                (!isPembinaPolresRole && !isSekolahAccount ? 1 : 0) +
+                (isSuperAdmin ? 1 : 0);
 
-              {/* Menu Rekap Pendaftaran Sekolah (Dapat diakses Admin, Super Admin, dan Pembina Polres) */}
-              {(isAdminRole || isPembinaPolresRole) && (
-                <button
-                  onClick={() => {
-                    setCurrentTab('rekap_pendaftaran');
-                    setSidebarOpen(false);
-                  }}
-                  className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs transition cursor-pointer font-bold ${
-                    currentTab === 'rekap_pendaftaran'
-                      ? 'bg-blue-600 text-white shadow'
-                      : 'text-blue-400 hover:text-blue-300 hover:bg-slate-800'
-                  }`}
-                >
-                  <div className="flex items-center gap-2 min-w-0">
-                    <FileText className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-                    {!sidebarCollapsed && <span className="truncate">Rekap Pendaftaran Sekolah</span>}
-                  </div>
-                  {!sidebarCollapsed && registrationsList.length > 0 && (
-                    <span className="px-1.5 py-0.5 rounded-full text-[10px] font-black bg-blue-500/30 text-blue-200">
-                      {registrationsList.length}
-                    </span>
-                  )}
-                </button>
-              )}
+              if (!showPendaftaranGroup && !showLombaGroup && !showAkunGroup && !showSistemGroup) {
+                return null;
+              }
 
-              {/* Menu Operasional Admin (Dapat diakses Super Admin & Admin Panitia) */}
-              {isAdminRole && (
-                <>
-                  <button
-                    onClick={() => {
-                      setModalPaymentSettingsOpen(true);
-                    }}
-                    className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-amber-400 hover:text-amber-300 hover:bg-slate-800 transition cursor-pointer font-bold"
-                  >
-                    <CreditCard className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                    {!sidebarCollapsed && <span className="truncate">Tarif Biaya & Payment Gateway</span>}
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setModalBlankoEditorOpen(true);
-                    }}
-                    className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-indigo-400 hover:text-indigo-300 hover:bg-slate-800 transition cursor-pointer font-bold"
-                  >
-                    <FileText className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-                    {!sidebarCollapsed && <span className="truncate">Edit Format Blangko</span>}
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setModalSchoolAccountsOpen(true);
-                    }}
-                    className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-emerald-400 hover:text-emerald-300 hover:bg-slate-800 transition cursor-pointer font-bold"
-                  >
-                    <Building2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                    {!sidebarCollapsed && <span className="truncate">Kelola Akun Sekolah</span>}
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setUserFormTab('list');
-                      setModalUserOpen(true);
-                    }}
-                    className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition cursor-pointer"
-                  >
-                    <Users className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-                    {!sidebarCollapsed && <span className="truncate">Kelola User & Password</span>}
-                  </button>
-
-                  <button
-                    onClick={handleExportJson}
-                    className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition cursor-pointer"
-                  >
-                    <Download className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-                    {!sidebarCollapsed && <span className="truncate">Cadangkan Data (JSON)</span>}
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setModalAutoBackupOpen(true);
-                      setSidebarOpen(false);
-                    }}
-                    className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition cursor-pointer"
-                  >
-                    <div className="flex items-center gap-2 min-w-0">
-                      <HardDrive className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                      {!sidebarCollapsed && <span className="truncate">Auto-Save & Cadangan 1 Jam</span>}
-                    </div>
-                    {!sidebarCollapsed && autoBackupSettings.autoBackupEnabled && autoBackupSettings.nextBackupAt && (
-                      <span className="text-[10px] font-mono tabular-nums text-emerald-400 shrink-0">
-                        {formatCountdownMs(Math.max(0, autoBackupSettings.nextBackupAt - dashboardNow.getTime()))}
-                      </span>
-                    )}
-                  </button>
-                </>
-              )}
-
-              {/* Menu Khusus Administrator Utama (Super Admin Master Controls) */}
-              {isSuperAdmin && (
-                <div className="pt-2 border-t border-slate-800/80 space-y-1">
+              return (
+                <div className="pt-2 border-t border-slate-800 space-y-2.5">
                   {!sidebarCollapsed && (
-                    <div className="px-2 pb-0.5 text-[9px] font-black uppercase text-amber-400/90 tracking-wider flex items-center gap-1">
-                      <Shield className="w-2.5 h-2.5 text-amber-400" />
-                      <span>Kontrol Master Administrator</span>
+                    <div className="px-2 text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                      Administrasi & Alat
                     </div>
                   )}
 
-                  <button
-                    onClick={() => setModalStatusOpen(true)}
-                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${
-                      appStatus.isActive
-                        ? 'text-emerald-400 hover:text-emerald-300 hover:bg-slate-800'
-                        : 'text-rose-400 bg-rose-950/40 hover:bg-rose-900/50'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2 truncate">
-                      <Power className={`w-3.5 h-3.5 shrink-0 ${appStatus.isActive ? 'text-emerald-400' : 'text-rose-400 animate-pulse'}`} />
-                      {!sidebarCollapsed && <span className="truncate">Status Operasional Aplikasi</span>}
+                  {/* KATEGORI 1: PENDAFTARAN & KEUANGAN */}
+                  {showPendaftaranGroup && (
+                    <div
+                      className={`bg-slate-950/40 rounded-xl border overflow-hidden transition ${
+                        currentTab === 'rekap_pendaftaran'
+                          ? 'border-blue-500/60'
+                          : 'border-slate-800/80'
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        aria-expanded={!sidebarCollapsed && sidebarPendaftaranDropdownOpen}
+                        onClick={() => toggleSidebarDropdown('pendaftaran')}
+                        className="w-full flex items-center justify-between p-2.5 text-xs font-bold text-slate-200 hover:bg-slate-800/60 transition cursor-pointer"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <div className="p-1.5 rounded-lg bg-blue-500/15 text-blue-400 shrink-0">
+                            <CreditCard className="w-4 h-4" />
+                          </div>
+                          {!sidebarCollapsed && (
+                            <div className="text-left truncate">
+                              <span className="block font-bold text-white text-xs truncate">
+                                Pendaftaran & Keuangan
+                              </span>
+                              <span className="text-[10px] text-slate-400 font-normal block truncate">
+                                Rekap, Tarif & Blangko
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                        {!sidebarCollapsed && (
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            {registrationsList.length > 0 && (
+                              <span className="text-[10px] font-bold bg-blue-500/20 text-blue-300 px-1.5 py-0.5 rounded tabular-nums">
+                                {registrationsList.length}
+                              </span>
+                            )}
+                            {sidebarPendaftaranDropdownOpen ? (
+                              <ChevronUp className="w-3.5 h-3.5 text-slate-400" />
+                            ) : (
+                              <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                            )}
+                          </div>
+                        )}
+                      </button>
+
+                      {!sidebarCollapsed && sidebarPendaftaranDropdownOpen && (
+                        <div className="p-2 pt-1.5 space-y-1 border-t border-slate-800/60">
+                          {(isAdminRole || isPembinaPolresRole) && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setCurrentTab('rekap_pendaftaran');
+                                setSidebarOpen(false);
+                              }}
+                              className={`w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-xs transition cursor-pointer font-semibold ${
+                                currentTab === 'rekap_pendaftaran'
+                                  ? 'bg-blue-600 text-white font-bold shadow'
+                                  : 'text-slate-300 hover:text-white hover:bg-slate-800'
+                              }`}
+                            >
+                              <div className="flex items-center gap-2 min-w-0">
+                                <FileText
+                                  className={`w-3.5 h-3.5 shrink-0 ${
+                                    currentTab === 'rekap_pendaftaran' ? 'text-white' : 'text-blue-400'
+                                  }`}
+                                />
+                                <span className="truncate">Rekap Pendaftaran Sekolah</span>
+                              </div>
+                              {registrationsList.length > 0 && (
+                                <span
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold tabular-nums shrink-0 ${
+                                    currentTab === 'rekap_pendaftaran'
+                                      ? 'bg-blue-700 text-white'
+                                      : 'bg-blue-500/25 text-blue-200'
+                                  }`}
+                                >
+                                  {registrationsList.length}
+                                </span>
+                              )}
+                            </button>
+                          )}
+
+                          {isAdminRole && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setModalPaymentSettingsOpen(true);
+                                  setSidebarOpen(false);
+                                }}
+                                className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition cursor-pointer font-semibold"
+                              >
+                                <CreditCard className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                                <span className="truncate">Tarif Biaya & Payment Gateway</span>
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setModalBlankoEditorOpen(true);
+                                  setSidebarOpen(false);
+                                }}
+                                className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition cursor-pointer font-semibold"
+                              >
+                                <FileText className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                                <span className="truncate">Edit Format Blangko</span>
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      )}
                     </div>
-                    {!sidebarCollapsed && (
-                      <span className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded ${
-                        appStatus.isActive ? 'bg-emerald-950 text-emerald-300 border border-emerald-500/30' : 'bg-rose-600 text-white'
-                      }`}>
-                        {appStatus.isActive ? 'Aktif' : 'Nonaktif'}
-                      </span>
-                    )}
-                  </button>
+                  )}
 
-                  <button
-                    onClick={() => setModalLogoOpen(true)}
-                    className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-amber-300 hover:text-amber-200 hover:bg-slate-800 transition cursor-pointer font-semibold"
-                  >
-                    <ImageIcon className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                    {!sidebarCollapsed && <span className="truncate">Ubah Logo Aplikasi</span>}
-                  </button>
+                  {/* KATEGORI 2: LOMBA & JURI */}
+                  {showLombaGroup && (
+                    <div
+                      className={`bg-slate-950/40 rounded-xl border overflow-hidden transition ${
+                        currentTab === 'cerdas_cermat_admin'
+                          ? 'border-indigo-500/60'
+                          : 'border-slate-800/80'
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        aria-expanded={!sidebarCollapsed && sidebarLombaDropdownOpen}
+                        onClick={() => toggleSidebarDropdown('lomba')}
+                        className="w-full flex items-center justify-between p-2.5 text-xs font-bold text-slate-200 hover:bg-slate-800/60 transition cursor-pointer"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <div className="p-1.5 rounded-lg bg-indigo-500/15 text-indigo-400 shrink-0">
+                            <Award className="w-4 h-4" />
+                          </div>
+                          {!sidebarCollapsed && (
+                            <div className="text-left truncate">
+                              <span className="block font-bold text-white text-xs truncate">
+                                Lomba & Juri
+                              </span>
+                              <span className="text-[10px] text-slate-400 font-normal block truncate">
+                                Cerdas Cermat & Blanko Juri
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                        {!sidebarCollapsed && (
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            {isAdminRole && pendingCC > 0 ? (
+                              <span className="text-[10px] font-black bg-amber-500 text-slate-950 px-1.5 py-0.5 rounded tabular-nums">
+                                {pendingCC} Baru
+                              </span>
+                            ) : (
+                              <span className="text-[10px] font-bold bg-slate-800 text-indigo-300 px-1.5 py-0.5 rounded tabular-nums">
+                                {lombaMenuCount}
+                              </span>
+                            )}
+                            {sidebarLombaDropdownOpen ? (
+                              <ChevronUp className="w-3.5 h-3.5 text-slate-400" />
+                            ) : (
+                              <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                            )}
+                          </div>
+                        )}
+                      </button>
 
-                  <button
-                    onClick={() => {
-                      setTempCategoriesConfig([...categories]);
-                      setModalConfigOpen(true);
-                    }}
-                    className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition cursor-pointer"
-                  >
-                    <Settings className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                    {!sidebarCollapsed && <span className="truncate">Atur Juknis Nilai Maksimal</span>}
-                  </button>
+                      {!sidebarCollapsed && sidebarLombaDropdownOpen && (
+                        <div className="p-2 pt-1.5 space-y-1 border-t border-slate-800/60">
+                          {isAdminRole && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setCurrentTab('cerdas_cermat_admin');
+                                setSidebarOpen(false);
+                              }}
+                              className={`w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-xs transition cursor-pointer font-semibold ${
+                                currentTab === 'cerdas_cermat_admin'
+                                  ? 'bg-indigo-600 text-white font-bold shadow'
+                                  : 'text-slate-300 hover:text-white hover:bg-slate-800'
+                              }`}
+                            >
+                              <div className="flex items-center gap-2 min-w-0">
+                                <BookOpen
+                                  className={`w-3.5 h-3.5 shrink-0 ${
+                                    currentTab === 'cerdas_cermat_admin' ? 'text-white' : 'text-indigo-400'
+                                  }`}
+                                />
+                                <span className="truncate">Kelola & Nilai Cerdas Cermat</span>
+                              </div>
+                              {cerdasCermatSubmissions.length > 0 && (
+                                <span
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold tabular-nums shrink-0 ${
+                                    pendingCC > 0
+                                      ? 'bg-amber-500 text-slate-950 font-black'
+                                      : currentTab === 'cerdas_cermat_admin'
+                                      ? 'bg-indigo-700 text-white'
+                                      : 'bg-indigo-500/25 text-indigo-200'
+                                  }`}
+                                >
+                                  {pendingCC > 0 ? `${pendingCC} Baru` : cerdasCermatSubmissions.length}
+                                </span>
+                              )}
+                            </button>
+                          )}
 
-                  <label className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition cursor-pointer font-medium">
-                    <Upload className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                    {!sidebarCollapsed && <span className="truncate">Pulihkan Data (JSON)</span>}
-                    <input
-                      type="file"
-                      ref={fileInputRef}
-                      className="hidden"
-                      accept=".json"
-                      onChange={handleImportJson}
-                    />
-                  </label>
+                          {!isPembinaPolresRole && !isSekolahAccount && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setBlankSheetCatKey('pbb');
+                                setModalBlankSheetOpen(true);
+                                setSidebarOpen(false);
+                              }}
+                              className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition cursor-pointer font-semibold"
+                            >
+                              <Printer className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                              <span className="truncate">Format Blanko Juri Penilaian</span>
+                            </button>
+                          )}
 
-                  <button
-                    onClick={handleResetAllData}
-                    className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs text-rose-400 hover:text-rose-200 hover:bg-rose-950/40 transition cursor-pointer font-medium"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-                    {!sidebarCollapsed && <span className="truncate">Reset Semua Data</span>}
-                  </button>
+                          {isSuperAdmin && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setTempCategoriesConfig([...categories]);
+                                setModalConfigOpen(true);
+                                setSidebarOpen(false);
+                              }}
+                              className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition cursor-pointer font-semibold"
+                            >
+                              <Settings className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                              <span className="truncate">Atur Juknis Nilai Maksimal</span>
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* KATEGORI 3: AKUN */}
+                  {showAkunGroup && (
+                    <div className="bg-slate-950/40 rounded-xl border border-slate-800/80 overflow-hidden">
+                      <button
+                        type="button"
+                        aria-expanded={!sidebarCollapsed && sidebarAkunDropdownOpen}
+                        onClick={() => toggleSidebarDropdown('akun')}
+                        className="w-full flex items-center justify-between p-2.5 text-xs font-bold text-slate-200 hover:bg-slate-800/60 transition cursor-pointer"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <div className="p-1.5 rounded-lg bg-emerald-500/15 text-emerald-400 shrink-0">
+                            <Users className="w-4 h-4" />
+                          </div>
+                          {!sidebarCollapsed && (
+                            <div className="text-left truncate">
+                              <span className="block font-bold text-white text-xs truncate">Akun</span>
+                              <span className="text-[10px] text-slate-400 font-normal block truncate">
+                                Sekolah & User Panitia
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                        {!sidebarCollapsed && (
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <span className="text-[10px] font-bold bg-slate-800 text-emerald-300 px-1.5 py-0.5 rounded tabular-nums">
+                              2
+                            </span>
+                            {sidebarAkunDropdownOpen ? (
+                              <ChevronUp className="w-3.5 h-3.5 text-slate-400" />
+                            ) : (
+                              <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                            )}
+                          </div>
+                        )}
+                      </button>
+
+                      {!sidebarCollapsed && sidebarAkunDropdownOpen && (
+                        <div className="p-2 pt-1.5 space-y-1 border-t border-slate-800/60">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setModalSchoolAccountsOpen(true);
+                              setSidebarOpen(false);
+                            }}
+                            className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition cursor-pointer font-semibold"
+                          >
+                            <Building2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                            <span className="truncate">Kelola Akun Sekolah</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setUserFormTab('list');
+                              setModalUserOpen(true);
+                              setSidebarOpen(false);
+                            }}
+                            className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition cursor-pointer font-semibold"
+                          >
+                            <Users className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                            <span className="truncate">Kelola User & Password</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* KATEGORI 4: SISTEM */}
+                  {showSistemGroup && (
+                    <div className="bg-slate-950/40 rounded-xl border border-slate-800/80 overflow-hidden">
+                      <button
+                        type="button"
+                        aria-expanded={!sidebarCollapsed && sidebarSistemDropdownOpen}
+                        onClick={() => toggleSidebarDropdown('sistem')}
+                        className="w-full flex items-center justify-between p-2.5 text-xs font-bold text-slate-200 hover:bg-slate-800/60 transition cursor-pointer"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <div className="p-1.5 rounded-lg bg-amber-500/15 text-amber-400 shrink-0">
+                            <Settings className="w-4 h-4" />
+                          </div>
+                          {!sidebarCollapsed && (
+                            <div className="text-left truncate">
+                              <span className="block font-bold text-white text-xs truncate">Sistem</span>
+                              <span className="text-[10px] text-slate-400 font-normal block truncate">
+                                Cadangan, Logo & Status
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                        {!sidebarCollapsed && (
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            {isSuperAdmin && (
+                              <span
+                                className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded ${
+                                  appStatus.isActive
+                                    ? 'bg-emerald-950 text-emerald-300 border border-emerald-500/30'
+                                    : 'bg-rose-600 text-white'
+                                }`}
+                              >
+                                {appStatus.isActive ? 'Aktif' : 'Off'}
+                              </span>
+                            )}
+                            {sidebarSistemDropdownOpen ? (
+                              <ChevronUp className="w-3.5 h-3.5 text-slate-400" />
+                            ) : (
+                              <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                            )}
+                          </div>
+                        )}
+                      </button>
+
+                      {!sidebarCollapsed && sidebarSistemDropdownOpen && (
+                        <div className="p-2 pt-1.5 space-y-1 border-t border-slate-800/60">
+                          {isAdminRole && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setModalAutoBackupOpen(true);
+                                  setSidebarOpen(false);
+                                }}
+                                className="w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition cursor-pointer font-semibold"
+                              >
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <HardDrive className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                                  <span className="truncate">Auto-Save & Cadangan 1 Jam</span>
+                                </div>
+                                {autoBackupSettings.autoBackupEnabled && autoBackupSettings.nextBackupAt && (
+                                  <span className="text-[10px] font-mono tabular-nums text-emerald-400 shrink-0">
+                                    {formatCountdownMs(Math.max(0, autoBackupSettings.nextBackupAt - dashboardNow.getTime()))}
+                                  </span>
+                                )}
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  handleExportJson();
+                                  setSidebarOpen(false);
+                                }}
+                                className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition cursor-pointer font-semibold"
+                              >
+                                <Download className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                                <span className="truncate">Cadangkan Data (JSON)</span>
+                              </button>
+                            </>
+                          )}
+
+                          {isSuperAdmin && (
+                            <>
+                              <label className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition cursor-pointer font-semibold">
+                                <Upload className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                                <span className="truncate">Pulihkan Data (JSON)</span>
+                                <input
+                                  type="file"
+                                  ref={fileInputRef}
+                                  className="hidden"
+                                  accept=".json"
+                                  onChange={handleImportJson}
+                                />
+                              </label>
+
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setModalLogoOpen(true);
+                                  setSidebarOpen(false);
+                                }}
+                                className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs text-slate-300 hover:text-white hover:bg-slate-800 transition cursor-pointer font-semibold"
+                              >
+                                <ImageIcon className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                                <span className="truncate">Ubah Logo Aplikasi</span>
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setModalStatusOpen(true);
+                                  setSidebarOpen(false);
+                                }}
+                                className={`w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-xs font-semibold transition cursor-pointer ${
+                                  appStatus.isActive
+                                    ? 'text-slate-300 hover:text-white hover:bg-slate-800'
+                                    : 'text-rose-300 bg-rose-950/40 hover:bg-rose-900/50'
+                                }`}
+                              >
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <Power
+                                    className={`w-3.5 h-3.5 shrink-0 ${
+                                      appStatus.isActive ? 'text-emerald-400' : 'text-rose-400'
+                                    }`}
+                                  />
+                                  <span className="truncate">Status Operasional Aplikasi</span>
+                                </div>
+                                <span
+                                  className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded shrink-0 ${
+                                    appStatus.isActive
+                                      ? 'bg-emerald-950 text-emerald-300 border border-emerald-500/30'
+                                      : 'bg-rose-600 text-white'
+                                  }`}
+                                >
+                                  {appStatus.isActive ? 'Aktif' : 'Nonaktif'}
+                                </span>
+                              </button>
+
+                              <div className="pt-1 mt-1 border-t border-slate-800/80">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    handleResetAllData();
+                                    setSidebarOpen(false);
+                                  }}
+                                  className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs text-rose-400 hover:text-rose-200 hover:bg-rose-950/40 transition cursor-pointer font-semibold"
+                                >
+                                  <RotateCcw className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                                  <span className="truncate">Reset Semua Data</span>
+                                </button>
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
+              );
+            })()}
 
             {/* Download / Install PWA App Button inside Sidebar */}
             <div className="pt-2 border-t border-slate-800/80">
@@ -6397,6 +7655,8 @@ export default function App() {
               isOnline={isOnline}
               pendingCount={pendingOfflineCount}
               isSyncing={isSyncingOffline}
+              cloudQuotaExceeded={cloudQuotaExceeded}
+              serverBackupAvailable={serverBackupStatus.available}
               onSyncNow={() => void handleFlushOfflineQueue(false)}
             />
             {cloudQuotaExceeded && !quotaBannerDismissed && (
@@ -6410,17 +7670,30 @@ export default function App() {
                   </div>
                   <div className="min-w-0 space-y-1">
                     <div className="text-xs font-bold text-amber-950">
-                      Kuota Tulis Harian Cloud Firestore Tercapai — Mode Penyimpanan Lokal Aktif
+                      Mode Hemat Kuota Cloud Aktif —{' '}
+                      {serverBackupStatus.available
+                        ? 'Cadangan Server Express & Penyimpanan Lokal Menjaga Data Tetap Aman'
+                        : 'Penyimpanan Lokal Menjaga Data Tetap Aman'}
                     </div>
                     <p className="text-xs text-amber-900 leading-relaxed">
-                      Batas harian unit tulis gratis database telah terpenuhi. Penulisan ke Cloud dijeda otomatis untuk menghentikan percobaan ulang berlebih dan akan direset otomatis pada keesokan harinya. Input nilai dan perubahan tetap disimpan di perangkat ini (localStorage). Informasi batas paket <strong>Spark</strong> dan bagian <strong>Enterprise edition</strong> dapat dilihat pada{' '}
+                      Kuota tulis harian Cloud Firestore sedang penuh dan akan direset otomatis keesokan harinya. Penulisan massal saat pembukaan aplikasi telah dimatikan; setiap perubahan baru otomatis dikirim ke <strong>Cadangan Server</strong> & antrean Delta Sync. Rincian kuota paket <strong>Spark</strong> dan bagian <strong>Enterprise edition</strong>:{' '}
                       <a
-                        href="https://firebase.google.com/pricing#cloud-firestore"
+                        href={FIREBASE_PRICING_URL}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="font-bold underline inline-flex items-center gap-0.5 text-amber-950 hover:text-amber-700"
                       >
                         Firebase Pricing (Cloud Firestore)
+                        <ExternalLink className="w-3 h-3 inline" />
+                      </a>
+                      {' · '}
+                      <a
+                        href={FIRESTORE_UPGRADE_CONSOLE_URL}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="font-bold underline inline-flex items-center gap-0.5 text-amber-950 hover:text-amber-700"
+                      >
+                        Buka Konsol Database
                         <ExternalLink className="w-3 h-3 inline" />
                       </a>
                       .
@@ -6434,7 +7707,7 @@ export default function App() {
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold transition cursor-pointer whitespace-nowrap"
                   >
                     <Cloud className="w-3.5 h-3.5" />
-                    <span>Detail Cloud</span>
+                    <span>Detail & Cadangan</span>
                   </button>
                   <button
                     type="button"
@@ -6538,88 +7811,17 @@ export default function App() {
               </div>
             </div>
 
-            {/* 2. 4 KARTU STATISTIK RINGKASAN PENILAIAN SEKOLAH */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              {/* Card 1: Total Sekolah Terdaftar */}
-              <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex items-center justify-between gap-3">
-                <div>
-                  <span className="text-xs font-bold uppercase tracking-wider text-slate-400 block mb-1">
-                    Sekolah Terdaftar
-                  </span>
-                  <div className="text-3xl font-black text-slate-900 tabular-nums">
-                    {dashboardProgressStats.totalRegistered}
-                  </div>
-                  <span className="text-[11px] text-slate-500 mt-1 block">
-                    Kontingen dalam basis data
-                  </span>
-                </div>
-                <div className="w-12 h-12 rounded-2xl bg-blue-50 text-blue-600 flex items-center justify-center shrink-0">
-                  <Building2 className="w-6 h-6" />
-                </div>
-              </div>
-
-              {/* Card 2: Sudah Selesai 100% */}
-              <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex items-center justify-between gap-3">
-                <div>
-                  <span className="text-xs font-bold uppercase tracking-wider text-emerald-600 block mb-1">
-                    Selesai Dinilai
-                  </span>
-                  <div className="text-3xl font-black text-emerald-700 tabular-nums">
-                    {dashboardProgressStats.completedCount}
-                  </div>
-                  <span className="text-[11px] text-slate-500 mt-1 block">
-                    {dashboardProgressStats.totalRegistered > 0
-                      ? `${Math.round((dashboardProgressStats.completedCount / dashboardProgressStats.totalRegistered) * 100)}% dari total sekolah`
-                      : 'Belum ada data'}
-                  </span>
-                </div>
-                <div className="w-12 h-12 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
-                  <CheckCircle2 className="w-6 h-6" />
-                </div>
-              </div>
-
-              {/* Card 3: Belum Selesai / Belum Dinilai */}
-              <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex items-center justify-between gap-3">
-                <div>
-                  <span className="text-xs font-bold uppercase tracking-wider text-amber-600 block mb-1">
-                    Belum Selesai
-                  </span>
-                  <div className="text-3xl font-black text-amber-600 tabular-nums">
-                    {dashboardProgressStats.inProgressCount + dashboardProgressStats.unscoredCount}
-                  </div>
-                  <span className="text-[11px] text-slate-500 mt-1 block">
-                    {dashboardProgressStats.inProgressCount} proses, {dashboardProgressStats.unscoredCount} kosong
-                  </span>
-                </div>
-                <div className="w-12 h-12 rounded-2xl bg-amber-50 text-amber-600 flex items-center justify-center shrink-0">
-                  <Clock className="w-6 h-6" />
-                </div>
-              </div>
-
-              {/* Card 4: Persentase Progres */}
-              <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex items-center justify-between gap-3">
-                <div className="min-w-0 flex-1">
-                  <span className="text-xs font-bold uppercase tracking-wider text-indigo-600 block mb-1">
-                    Progres Penilaian
-                  </span>
-                  <div className="text-3xl font-black text-indigo-700 tabular-nums">
-                    {dashboardProgressStats.completionRate}%
-                  </div>
-                  <div className="w-full bg-slate-100 rounded-full h-1.5 mt-2 overflow-hidden">
-                    <div
-                      className="bg-indigo-600 h-1.5 rounded-full transition-all duration-500"
-                      style={{ width: `${dashboardProgressStats.completionRate}%` }}
-                    />
-                  </div>
-                </div>
-                <div className="w-12 h-12 rounded-2xl bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0">
-                  <BarChart3 className="w-6 h-6" />
-                </div>
-              </div>
-            </div>
-
-            {/* 3. CHART PROGRES PENILAIAN SEKOLAH (DONUT + MULTI-SEGMENT BAR) */}
-            <div className="bg-white rounded-2xl p-6 sm:p-7 border border-slate-200 shadow-sm space-y-6">
+            {isSekolahAccount ? (
+              <SchoolPksMembersDashboardSection
+                submissionsList={scopedRegistrationsList}
+                schoolDisplayName={currentUser.schoolName || currentUser.name}
+                schoolLevel={currentUser.schoolLevel}
+                onNavigateTab={setCurrentTab}
+              />
+            ) : (
+              <>
+                {/* 2. GRAFIK PROGRES PENILAIAN SEKOLAH (DONUT + MULTI-SEGMENT BAR) */}
+                <div className="bg-white rounded-2xl p-6 sm:p-7 border border-slate-200 shadow-sm space-y-6">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-100 pb-4">
                 <div>
                   <h3 className="text-lg font-black text-slate-900 flex items-center gap-2">
@@ -6843,193 +8045,14 @@ export default function App() {
               </div>
             </div>
 
-            {/* 4. TABEL DAFTAR SEKOLAH & PROGRES PENILAIAN */}
-            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-              <div className="p-5 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50/50">
-                <div>
-                  <h4 className="font-bold text-sm sm:text-base text-slate-900 flex items-center gap-2">
-                    <ListChecks className="w-4 h-4 text-blue-600" />
-                    Status Penilaian Berdasarkan Sekolah Terdaftar
-                  </h4>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    Rincian progres pengisian nilai untuk setiap peserta dan asal sekolah
-                  </p>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2">
-                  {isAdminRole && (
-                    <button
-                      onClick={() => setModalSchoolAccountsOpen(true)}
-                      className="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer shadow-xs"
-                    >
-                      <Building2 className="w-3.5 h-3.5" /> Kelola Akun Sekolah
-                    </button>
-                  )}
-                  <button
-                    onClick={() => handleExportDaftarPesertaExcel('all')}
-                    className="bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
-                  >
-                    <Download className="w-3.5 h-3.5" /> Unduh Daftar Excel
-                  </button>
-                  {!isUserRole && !isPembinaPolresRole && (
-                    <button
-                      onClick={openNewPesertaModal}
-                      className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer shadow-xs"
-                    >
-                      <UserPlus className="w-3.5 h-3.5" /> Tambah Peserta
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              {dashboardProgressStats.schoolProgressList.length === 0 ? (
-                <div className="p-8 text-center text-slate-500 text-xs">
-                  Tidak ada data sekolah yang sesuai dengan filter pencarian.
-                </div>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-xs text-left">
-                    <thead className="bg-slate-100 text-slate-600 uppercase font-black tracking-wider text-[10px] border-b border-slate-200">
-                      <tr>
-                        <th className="py-3 px-4">No. Peserta</th>
-                        <th className="py-3 px-4">Asal Sekolah & Peleton</th>
-                        <th className="py-3 px-3 text-center">Jenjang</th>
-                        <th className="py-3 px-4">Progres Penilaian</th>
-                        <th className="py-3 px-4 text-center">Total Nilai</th>
-                        <th className="py-3 px-4 text-center">Status</th>
-                        <th className="py-3 px-4 text-right">Aksi</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-200">
-                      {dashboardProgressStats.schoolProgressList.map(item => {
-                        const p = item.participant;
-                        const isCurrentActive = p.id === activePesertaId;
-
-                        return (
-                          <tr
-                            key={p.id}
-                            className={`hover:bg-blue-50/40 transition ${
-                              isCurrentActive ? 'bg-blue-50/70 font-medium' : ''
-                            }`}
-                          >
-                            <td className="py-3 px-4 font-black text-slate-900">
-                              <span className="bg-slate-100 border border-slate-300 px-2 py-0.5 rounded-md font-mono">
-                                No. {p.nomor}
-                              </span>
-                            </td>
-
-                            <td className="py-3 px-4">
-                              <div className="font-bold text-slate-900">{p.sekolah}</div>
-                              {p.peleton && (
-                                <div className="text-[11px] text-slate-500">Peleton: {p.peleton}</div>
-                              )}
-                            </td>
-
-                            <td className="py-3 px-3 text-center">
-                              <span
-                                className={`px-2 py-0.5 rounded text-[10px] font-black uppercase text-white ${
-                                  p.jenjang === 'SLTA' ? 'bg-indigo-600' : 'bg-blue-600'
-                                }`}
-                              >
-                                {p.jenjang || 'SLTP'}
-                              </span>
-                            </td>
-
-                            <td className="py-3 px-4 min-w-[180px]">
-                              <div className="flex items-center justify-between text-[11px] mb-1">
-                                <span className="font-semibold text-slate-700 tabular-nums">
-                                  {item.completedCats} / {categories.length} Kategori
-                                </span>
-                                <span className="font-mono text-slate-500">
-                                  {item.pct.toFixed(0)}%
-                                </span>
-                              </div>
-                              <div className="w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
-                                <div
-                                  className={`h-1.5 rounded-full ${
-                                    item.isComplete
-                                      ? 'bg-emerald-500'
-                                      : item.completedCats > 0
-                                      ? 'bg-amber-500'
-                                      : 'bg-slate-300'
-                                  }`}
-                                  style={{ width: `${(item.completedCats / (categories.length || 1)) * 100}%` }}
-                                />
-                              </div>
-                            </td>
-
-                            <td className="py-3 px-4 text-center font-black text-sm tabular-nums text-slate-900">
-                              {item.grandTotal > 0 ? (
-                                <span className="text-blue-600">{item.grandTotal}</span>
-                              ) : (
-                                <span className="text-slate-400 font-normal">0</span>
-                              )}
-                            </td>
-
-                            <td className="py-3 px-4 text-center">
-                              {item.isComplete ? (
-                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">
-                                  <CheckCircle2 className="w-3 h-3 text-emerald-600" /> Selesai 100%
-                                </span>
-                              ) : item.completedCats > 0 ? (
-                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 tabular-nums">
-                                  <Clock className="w-3 h-3 text-amber-600" /> Proses ({item.completedCats}/{categories.length})
-                                </span>
-                              ) : (
-                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-600">
-                                  Belum Diisi
-                                </span>
-                              )}
-                            </td>
-
-                            <td className="py-3 px-4 text-right">
-                              <div className="flex items-center justify-end gap-1.5">
-                                {!isPembinaPolresRole && !isSekolahAccount && (
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setActivePesertaId(p.id);
-                                      setCurrentTab('pbb');
-                                    }}
-                                    className="px-2.5 py-1 bg-blue-50 hover:bg-blue-100 text-blue-700 font-bold rounded-lg text-[11px] transition cursor-pointer"
-                                    title="Buka form penilaian untuk peserta ini"
-                                  >
-                                    Nilai
-                                  </button>
-                                )}
-                                {!isUserRole && !isPembinaPolresRole && (
-                                  <button
-                                    type="button"
-                                    onClick={() => openEditPesertaModal(p)}
-                                    className="p-1 hover:bg-slate-100 text-slate-500 hover:text-slate-800 rounded-lg transition cursor-pointer"
-                                    title="Edit data sekolah/peserta"
-                                  >
-                                    <Edit className="w-3.5 h-3.5" />
-                                  </button>
-                                )}
-                                {(isPembinaPolresRole || isSekolahAccount) && (
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setPrintPesertaId(p.id);
-                                      setModalPrintOpen(true);
-                                    }}
-                                    className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-lg text-[11px] transition cursor-pointer inline-flex items-center gap-1"
-                                    title="Lihat ringkasan nilai peserta"
-                                  >
-                                    <Eye className="w-3 h-3" /> Detail
-                                  </button>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
+                {/* 3. GRAFIK JUMLAH ANGGOTA PKS BERDASARKAN KATEGORI */}
+                <AdminPksCategoryChart
+                  submissionsList={registrationsList}
+                  onNavigateTab={setCurrentTab}
+                  canOpenRekapPendaftaran={isAdminRole || isPembinaPolresRole}
+                />
+              </>
+            )}
 
           </div>
         )}
@@ -7389,7 +8412,7 @@ export default function App() {
                       onChange={e => setCurrentTab(e.target.value)}
                       className="bg-white border border-slate-300 text-slate-900 text-xs font-bold py-1.5 px-3 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer"
                     >
-                      {categories.map((c, i) => (
+                      {scoringCategories.map((c, i) => (
                         <option key={c.key} value={c.key}>
                           {i + 1}. {c.title} (Max {c.maxPoints})
                         </option>
@@ -7399,7 +8422,7 @@ export default function App() {
 
                   <button
                     onClick={handleNextCategory}
-                    disabled={currentCategoryIndex >= categories.length - 1}
+                    disabled={currentCategoryIndex >= scoringCategories.length - 1}
                     className="p-1.5 rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
                     title="Kategori Berikutnya"
                   >
@@ -7478,8 +8501,6 @@ export default function App() {
                         const secStats = c.section ? sectionTotals[c.section] : null;
                         const selectedVal = activePeserta?.scores?.[activeCategory.key]?.[c.no];
                         const isScored = selectedVal !== undefined && selectedVal !== null;
-                        const rowKey = activePeserta ? `${activePeserta.id}:${activeCategory.key}:${c.no}` : '';
-                        const isRowSaving = Boolean(rowKey && savingCriterionKeys[rowKey]);
 
                         return (
                           <React.Fragment key={c.no}>
@@ -7512,7 +8533,7 @@ export default function App() {
 
                               <td className="py-2.5 px-3 text-center bg-slate-50/70">
                                 <select
-                                  disabled={isUserRole || isRowSaving}
+                                  disabled={isUserRole}
                                   value={isScored ? String(selectedVal) : ''}
                                   onChange={e => {
                                     const val = e.target.value === '' ? null : Number(e.target.value);
@@ -7537,12 +8558,12 @@ export default function App() {
                                 const isChecked = selectedVal === val;
                                 return (
                                   <td key={wIdx} className="py-2.5 px-1.5 text-center">
-                                    <label className={`block ${isUserRole || isRowSaving ? 'cursor-not-allowed opacity-70' : 'cursor-pointer'}`}>
+                                    <label className={`block ${isUserRole ? 'cursor-not-allowed opacity-70' : 'cursor-pointer'}`}>
                                       <input
                                         type="radio"
                                         name={`${activeCategory.key}_${c.no}`}
                                         value={val}
-                                        disabled={isUserRole || isRowSaving}
+                                        disabled={isUserRole}
                                         checked={isChecked}
                                         onChange={() => void handleScoreSelect(activeCategory.key, c.no, val)}
                                         className="hidden"
@@ -7562,13 +8583,7 @@ export default function App() {
                               })}
 
                               <td className="py-2.5 px-4 text-center font-black text-blue-700 bg-slate-50 text-base tabular-nums">
-                                {isRowSaving ? (
-                                  <Loader2 className="w-4 h-4 animate-spin text-blue-600 mx-auto" />
-                                ) : isScored ? (
-                                  selectedVal
-                                ) : (
-                                  '-'
-                                )}
+                                {isScored ? selectedVal : '-'}
                               </td>
                             </tr>
                           </React.Fragment>
@@ -7871,7 +8886,7 @@ export default function App() {
                               PIALA BERGILIR JUARA UMUM TINGKAT SLTP
                             </h2>
                             <p className="text-xs text-blue-200">
-                              Akumulasi nilai seluruh mata lomba khusus jenjang SMP / MTs (Maks. {activeCalc?.maxGrandTotal || 1200} Poin).
+                              Penentuan berdasarkan perolehan tropi Juara 1 terbanyak per peleton (tie-breaker: Juara 2, Juara 3, lalu Total Poin) jenjang SMP / MTs.
                             </p>
                           </div>
                         </div>
@@ -7905,9 +8920,14 @@ export default function App() {
                               <div>
                                 <h4 className="font-black text-slate-900 text-base leading-tight truncate">{j2.sekolah}</h4>
                                 <p className="text-xs text-blue-600 font-semibold">{j2.peleton || `No. ${j2.nomor}`}</p>
-                                <div className="mt-3 flex items-baseline justify-between pt-2 border-t border-slate-100">
-                                  <span className="text-xs text-slate-500">Total Nilai:</span>
-                                  <span className="text-lg font-black text-slate-800">{j2.calc.grandTotal} <span className="text-xs font-normal text-slate-500">/ {j2.calc.maxGrandTotal} ({j2.calc.grandPct.toFixed(1)}%)</span></span>
+                                <div className="mt-3 pt-2 border-t border-slate-100 space-y-1">
+                                  <div className="flex items-baseline justify-between">
+                                    <span className="text-xs text-slate-500">Tropi Juara 1:</span>
+                                    <span className="text-lg font-black text-slate-800 tabular-nums">{j2.trophyCounts.juara1} Tropi</span>
+                                  </div>
+                                  <p className="text-[11px] text-slate-500 tabular-nums">
+                                    Juara 2: {j2.trophyCounts.juara2} · Juara 3: {j2.trophyCounts.juara3} · Total: {j2.calc.grandTotal} Poin
+                                  </p>
                                 </div>
                               </div>
                             ) : (
@@ -7929,9 +8949,14 @@ export default function App() {
                               <div>
                                 <h4 className="font-black text-slate-900 text-lg leading-tight truncate">{j1.sekolah}</h4>
                                 <p className="text-xs text-blue-600 font-bold">{j1.peleton || `No. ${j1.nomor}`}</p>
-                                <div className="mt-3 flex items-baseline justify-between pt-2 border-t border-amber-200">
-                                  <span className="text-xs text-amber-900 font-bold">Skor Tertinggi:</span>
-                                  <span className="text-2xl font-black text-amber-950">{j1.calc.grandTotal} <span className="text-xs font-normal text-slate-600">/ {j1.calc.maxGrandTotal} ({j1.calc.grandPct.toFixed(1)}%)</span></span>
+                                <div className="mt-3 pt-2 border-t border-amber-200 space-y-1">
+                                  <div className="flex items-baseline justify-between">
+                                    <span className="text-xs text-amber-900 font-bold">Tropi Juara 1:</span>
+                                    <span className="text-2xl font-black text-amber-950 tabular-nums">{j1.trophyCounts.juara1} Tropi</span>
+                                  </div>
+                                  <p className="text-[11px] text-amber-900/80 font-medium tabular-nums">
+                                    Juara 2: {j1.trophyCounts.juara2} · Juara 3: {j1.trophyCounts.juara3} · Total: {j1.calc.grandTotal} Poin
+                                  </p>
                                 </div>
                               </div>
                             ) : (
@@ -7953,9 +8978,14 @@ export default function App() {
                               <div>
                                 <h4 className="font-black text-slate-900 text-base leading-tight truncate">{j3.sekolah}</h4>
                                 <p className="text-xs text-blue-600 font-semibold">{j3.peleton || `No. ${j3.nomor}`}</p>
-                                <div className="mt-3 flex items-baseline justify-between pt-2 border-t border-slate-100">
-                                  <span className="text-xs text-slate-500">Total Nilai:</span>
-                                  <span className="text-lg font-black text-slate-800">{j3.calc.grandTotal} <span className="text-xs font-normal text-slate-500">/ {j3.calc.maxGrandTotal} ({j3.calc.grandPct.toFixed(1)}%)</span></span>
+                                <div className="mt-3 pt-2 border-t border-slate-100 space-y-1">
+                                  <div className="flex items-baseline justify-between">
+                                    <span className="text-xs text-slate-500">Tropi Juara 1:</span>
+                                    <span className="text-lg font-black text-slate-800 tabular-nums">{j3.trophyCounts.juara1} Tropi</span>
+                                  </div>
+                                  <p className="text-[11px] text-slate-500 tabular-nums">
+                                    Juara 2: {j3.trophyCounts.juara2} · Juara 3: {j3.trophyCounts.juara3} · Total: {j3.calc.grandTotal} Poin
+                                  </p>
                                 </div>
                               </div>
                             ) : (
@@ -7988,6 +9018,10 @@ export default function App() {
                                   <span className="text-[10px] text-slate-500 font-normal">Max {cat.maxPoints}</span>
                                 </th>
                               ))}
+                              <th className="py-3 px-3 text-center w-32 bg-amber-100/70 text-amber-950 font-black whitespace-nowrap">
+                                Perolehan Tropi<br />
+                                <span className="text-[10px] text-amber-700 font-normal">J1 · J2 · J3</span>
+                              </th>
                               <th className="py-3 px-3 text-center w-28 bg-amber-50 text-amber-950 font-black">
                                 Total Nilai<br />
                                 <span className="text-[10px] text-amber-600 font-normal">Max {activeCalc?.maxGrandTotal}</span>
@@ -8000,7 +9034,7 @@ export default function App() {
                           <tbody className="divide-y divide-slate-200 font-medium">
                             {sltpItems.length === 0 ? (
                               <tr>
-                                <td colSpan={8 + categories.length} className="py-8 text-center text-slate-400">
+                                <td colSpan={9 + categories.length} className="py-8 text-center text-slate-400">
                                   Tidak ada peserta tingkat SLTP ditemukan.
                                 </td>
                               </tr>
@@ -8119,6 +9153,14 @@ export default function App() {
                                       );
                                     })}
 
+                                    <td className="py-3 px-3 text-center bg-amber-50/60 tabular-nums whitespace-nowrap">
+                                      <div className="font-black text-amber-950 text-sm">
+                                        🥇 {item.trophyCounts.juara1}
+                                      </div>
+                                      <div className="text-[10px] text-slate-600 font-semibold mt-0.5">
+                                        🥈 {item.trophyCounts.juara2} · 🥉 {item.trophyCounts.juara3}
+                                      </div>
+                                    </td>
                                     <td className="py-3 px-3 text-center font-black text-amber-950 bg-amber-50 text-base tabular-nums">
                                       {item.calc.grandTotal}
                                     </td>
@@ -8201,7 +9243,7 @@ export default function App() {
                               PIALA BERGILIR JUARA UMUM TINGKAT SLTA
                             </h2>
                             <p className="text-xs text-indigo-200">
-                              Akumulasi nilai seluruh mata lomba khusus jenjang SMA / SMK / MA (Maks. {activeCalc?.maxGrandTotal || 1200} Poin).
+                              Penentuan berdasarkan perolehan tropi Juara 1 terbanyak per peleton (tie-breaker: Juara 2, Juara 3, lalu Total Poin) jenjang SMA / SMK / MA.
                             </p>
                           </div>
                         </div>
@@ -8235,9 +9277,14 @@ export default function App() {
                               <div>
                                 <h4 className="font-black text-slate-900 text-base leading-tight truncate">{j2.sekolah}</h4>
                                 <p className="text-xs text-indigo-600 font-semibold">{j2.peleton || `No. ${j2.nomor}`}</p>
-                                <div className="mt-3 flex items-baseline justify-between pt-2 border-t border-slate-100">
-                                  <span className="text-xs text-slate-500">Total Nilai:</span>
-                                  <span className="text-lg font-black text-slate-800">{j2.calc.grandTotal} <span className="text-xs font-normal text-slate-500">/ {j2.calc.maxGrandTotal} ({j2.calc.grandPct.toFixed(1)}%)</span></span>
+                                <div className="mt-3 pt-2 border-t border-slate-100 space-y-1">
+                                  <div className="flex items-baseline justify-between">
+                                    <span className="text-xs text-slate-500">Tropi Juara 1:</span>
+                                    <span className="text-lg font-black text-slate-800 tabular-nums">{j2.trophyCounts.juara1} Tropi</span>
+                                  </div>
+                                  <p className="text-[11px] text-slate-500 tabular-nums">
+                                    Juara 2: {j2.trophyCounts.juara2} · Juara 3: {j2.trophyCounts.juara3} · Total: {j2.calc.grandTotal} Poin
+                                  </p>
                                 </div>
                               </div>
                             ) : (
@@ -8259,9 +9306,14 @@ export default function App() {
                               <div>
                                 <h4 className="font-black text-slate-900 text-lg leading-tight truncate">{j1.sekolah}</h4>
                                 <p className="text-xs text-indigo-600 font-bold">{j1.peleton || `No. ${j1.nomor}`}</p>
-                                <div className="mt-3 flex items-baseline justify-between pt-2 border-t border-amber-200">
-                                  <span className="text-xs text-amber-900 font-bold">Skor Tertinggi:</span>
-                                  <span className="text-2xl font-black text-amber-950">{j1.calc.grandTotal} <span className="text-xs font-normal text-slate-600">/ {j1.calc.maxGrandTotal} ({j1.calc.grandPct.toFixed(1)}%)</span></span>
+                                <div className="mt-3 pt-2 border-t border-amber-200 space-y-1">
+                                  <div className="flex items-baseline justify-between">
+                                    <span className="text-xs text-amber-900 font-bold">Tropi Juara 1:</span>
+                                    <span className="text-2xl font-black text-amber-950 tabular-nums">{j1.trophyCounts.juara1} Tropi</span>
+                                  </div>
+                                  <p className="text-[11px] text-amber-900/80 font-medium tabular-nums">
+                                    Juara 2: {j1.trophyCounts.juara2} · Juara 3: {j1.trophyCounts.juara3} · Total: {j1.calc.grandTotal} Poin
+                                  </p>
                                 </div>
                               </div>
                             ) : (
@@ -8283,9 +9335,14 @@ export default function App() {
                               <div>
                                 <h4 className="font-black text-slate-900 text-base leading-tight truncate">{j3.sekolah}</h4>
                                 <p className="text-xs text-indigo-600 font-semibold">{j3.peleton || `No. ${j3.nomor}`}</p>
-                                <div className="mt-3 flex items-baseline justify-between pt-2 border-t border-slate-100">
-                                  <span className="text-xs text-slate-500">Total Nilai:</span>
-                                  <span className="text-lg font-black text-slate-800">{j3.calc.grandTotal} <span className="text-xs font-normal text-slate-500">/ {j3.calc.maxGrandTotal} ({j3.calc.grandPct.toFixed(1)}%)</span></span>
+                                <div className="mt-3 pt-2 border-t border-slate-100 space-y-1">
+                                  <div className="flex items-baseline justify-between">
+                                    <span className="text-xs text-slate-500">Tropi Juara 1:</span>
+                                    <span className="text-lg font-black text-slate-800 tabular-nums">{j3.trophyCounts.juara1} Tropi</span>
+                                  </div>
+                                  <p className="text-[11px] text-slate-500 tabular-nums">
+                                    Juara 2: {j3.trophyCounts.juara2} · Juara 3: {j3.trophyCounts.juara3} · Total: {j3.calc.grandTotal} Poin
+                                  </p>
                                 </div>
                               </div>
                             ) : (
@@ -8318,6 +9375,10 @@ export default function App() {
                                   <span className="text-[10px] text-slate-500 font-normal">Max {cat.maxPoints}</span>
                                 </th>
                               ))}
+                              <th className="py-3 px-3 text-center w-32 bg-amber-100/70 text-amber-950 font-black whitespace-nowrap">
+                                Perolehan Tropi<br />
+                                <span className="text-[10px] text-amber-700 font-normal">J1 · J2 · J3</span>
+                              </th>
                               <th className="py-3 px-3 text-center w-28 bg-amber-50 text-amber-950 font-black">
                                 Total Nilai<br />
                                 <span className="text-[10px] text-amber-600 font-normal">Max {activeCalc?.maxGrandTotal}</span>
@@ -8330,7 +9391,7 @@ export default function App() {
                           <tbody className="divide-y divide-slate-200 font-medium">
                             {sltaItems.length === 0 ? (
                               <tr>
-                                <td colSpan={8 + categories.length} className="py-8 text-center text-slate-400">
+                                <td colSpan={9 + categories.length} className="py-8 text-center text-slate-400">
                                   Tidak ada peserta tingkat SLTA ditemukan.
                                 </td>
                               </tr>
@@ -8449,6 +9510,14 @@ export default function App() {
                                       );
                                     })}
 
+                                    <td className="py-3 px-3 text-center bg-amber-50/60 tabular-nums whitespace-nowrap">
+                                      <div className="font-black text-amber-950 text-sm">
+                                        🥇 {item.trophyCounts.juara1}
+                                      </div>
+                                      <div className="text-[10px] text-slate-600 font-semibold mt-0.5">
+                                        🥈 {item.trophyCounts.juara2} · 🥉 {item.trophyCounts.juara3}
+                                      </div>
+                                    </td>
                                     <td className="py-3 px-3 text-center font-black text-amber-950 bg-amber-50 text-base tabular-nums">
                                       {item.calc.grandTotal}
                                     </td>
@@ -9242,6 +10311,56 @@ export default function App() {
             currentUser={currentUser}
             paymentConfig={paymentConfig}
             onNavigateToForm={isPembinaPolresRole ? undefined : (targetTab) => setCurrentTab(targetTab)}
+            showToast={showToast}
+          />
+        )}
+
+        {/* ==================================================== */}
+        {/* MENU MANDIRI: PROFILE SEKOLAH LENGKAP                */}
+        {/* ==================================================== */}
+        {currentTab === 'profil_sekolah' && (
+          <SchoolProfileView
+            currentUser={currentUser}
+            usersList={usersList}
+            isAdminRole={isAdminRole}
+            isSekolahAccount={isSekolahAccount}
+            onSaveSchoolProfile={handleSaveSchoolProfile}
+            onOpenSchoolAccountManager={isAdminRole ? () => setModalSchoolAccountsOpen(true) : undefined}
+            showToast={showToast}
+          />
+        )}
+
+        {/* ==================================================== */}
+        {/* LOMBA CERDAS CERMAT: HANYA DIJAWAB AKUN SEKOLAH &     */}
+        {/* DIEDIT / DINILAI OLEH ADMIN                           */}
+        {/* ==================================================== */}
+        {currentTab === 'cerdas_cermat_sekolah' && isSekolahAccount && (
+          <CerdasCermatView
+            mode="school"
+            currentUser={currentUser}
+            quizConfig={cerdasCermatConfig}
+            submissionsList={cerdasCermatSubmissions}
+            participantsList={pesertaList}
+            usersList={usersList}
+            onSaveQuizConfig={handleSaveCerdasCermatConfig}
+            onSubmitSchoolAnswers={handleSubmitSchoolCerdasCermat}
+            onGradeSubmission={handleGradeCerdasCermatSubmission}
+            showToast={showToast}
+          />
+        )}
+
+        {currentTab === 'cerdas_cermat_admin' && isAdminRole && (
+          <CerdasCermatView
+            mode="admin"
+            currentUser={currentUser}
+            quizConfig={cerdasCermatConfig}
+            submissionsList={cerdasCermatSubmissions}
+            participantsList={pesertaList}
+            usersList={usersList}
+            onSaveQuizConfig={handleSaveCerdasCermatConfig}
+            onSubmitSchoolAnswers={handleSubmitSchoolCerdasCermat}
+            onGradeSubmission={handleGradeCerdasCermatSubmission}
+            onDeleteSubmission={handleDeleteCerdasCermatSubmission}
             showToast={showToast}
           />
         )}
@@ -10321,10 +11440,14 @@ export default function App() {
                   <p><strong>Hari / Tanggal:</strong> {printTargetParticipant.tanggal}</p>
                   <p><strong>Nama Juri:</strong> {printTargetParticipant.juri}</p>
                   <p>
-                    <strong>Peringkat Klasemen:</strong>{' '}
+                    <strong>Peringkat Klasemen ({printTargetParticipant.jenjang || 'SLTP'}):</strong>{' '}
                     {printTargetParticipant.rank
-                      ? `Peringkat / Juara ${printTargetParticipant.rank}`
+                      ? `Juara Umum / Peringkat ${printTargetParticipant.rank}`
                       : 'Belum Dinilai'}
+                  </p>
+                  <p>
+                    <strong>Perolehan Tropi Kategori:</strong>{' '}
+                    Juara 1: {printTargetParticipant.trophyCounts.juara1} · Juara 2: {printTargetParticipant.trophyCounts.juara2} · Juara 3: {printTargetParticipant.trophyCounts.juara3}
                   </p>
                 </div>
               </div>
@@ -11456,6 +12579,8 @@ export default function App() {
         cloudStatus={cloudStatus}
         cloudQuotaExceeded={cloudQuotaExceeded}
         pendingOfflineCount={pendingOfflineCount}
+        serverBackedUpQueueCount={serverBackedUpQueueCount}
+        serverBackupStatus={serverBackupStatus}
         lastSynced={cloudLastSynced}
         pesertaCount={pesertaList.length}
         usersCount={usersList.length}
@@ -11464,6 +12589,9 @@ export default function App() {
         nextBackupAt={autoBackupSettings.nextBackupAt}
         onOpenAutoBackup={isAdminRole ? () => setModalAutoBackupOpen(true) : undefined}
         onForceSyncAll={handleForceSyncAll}
+        onPullFromServerBackup={async () => {
+          await mergeServerBackupIntoLocalState(true);
+        }}
         showToast={showToast}
       />
 
@@ -11508,11 +12636,9 @@ export default function App() {
         paymentConfig={paymentConfig}
         onSave={async (newCfg: PaymentConfig) => {
           const res = await savePaymentConfigToCloud(newCfg);
-          if (res.success || res.queuedOffline) {
-            if (res.queuedOffline) {
-              setCloudStatus('offline');
-            } else {
-              setCloudStatus('connected');
+          if (res.success || res.queuedOffline || res.isQuotaError) {
+            setCloudStatus(resolveStatusFromCloudResult(res));
+            if (res.success) {
               setCloudLastSynced(new Date());
             }
             setPaymentConfig(newCfg);
@@ -11522,14 +12648,16 @@ export default function App() {
               // ignore
             }
             showToast(
-              res.queuedOffline
+              res.isQuotaError
+                ? 'Pengaturan tarif diamankan di Cadangan Server & lokal (kuota Cloud penuh).'
+                : res.queuedOffline
                 ? 'Pengaturan tarif disimpan offline & otomatis dikirim saat online.'
                 : 'Pengaturan tarif & payment gateway berhasil disimpan ke Cloud!',
-              res.queuedOffline ? 'info' : 'success'
+              res.queuedOffline || res.isQuotaError ? 'info' : 'success'
             );
             return true;
           } else {
-            setCloudStatus(res.isNetworkError ? 'offline' : 'error');
+            setCloudStatus(resolveStatusFromCloudResult(res));
             showToast(`Gagal menyimpan ke Cloud: ${res.error}`, 'error');
             return false;
           }
@@ -11546,11 +12674,9 @@ export default function App() {
         blankoConfig={blankoConfig}
         onSaveBlankoConfig={async (newCfg) => {
           const res = await saveBlankoConfigToCloud(newCfg);
-          if (res.success || res.queuedOffline) {
-            if (res.queuedOffline) {
-              setCloudStatus('offline');
-            } else {
-              setCloudStatus('connected');
+          if (res.success || res.queuedOffline || res.isQuotaError) {
+            setCloudStatus(resolveStatusFromCloudResult(res));
+            if (res.success) {
               setCloudLastSynced(new Date());
             }
             setBlankoConfig(newCfg);
@@ -11560,14 +12686,16 @@ export default function App() {
               // ignore
             }
             showToast(
-              res.queuedOffline
+              res.isQuotaError
+                ? 'Format blangko diamankan di Cadangan Server & lokal (kuota Cloud penuh).'
+                : res.queuedOffline
                 ? 'Format blangko disimpan offline & otomatis dikirim saat online.'
                 : 'Format blangko berhasil disimpan ke Cloud!',
-              res.queuedOffline ? 'info' : 'success'
+              res.queuedOffline || res.isQuotaError ? 'info' : 'success'
             );
             return true;
           } else {
-            setCloudStatus(res.isNetworkError ? 'offline' : 'error');
+            setCloudStatus(resolveStatusFromCloudResult(res));
             showToast(`Gagal menyimpan ke Cloud: ${res.error}`, 'error');
             return false;
           }

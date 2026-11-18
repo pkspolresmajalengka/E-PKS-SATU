@@ -114,7 +114,7 @@ export const AppStatusModal: React.FC<AppStatusModalProps> = ({
         updatedBy: 'admin'
       };
       const res = await onSaveStatus(updated);
-      if (res && !res.success) {
+      if (res && !res.success && !res.queuedOffline && !res.isQuotaError) {
         setNetworkError({
           title: 'Gagal Menyimpan Status Aplikasi ke Cloud',
           message: res.error || 'Terjadi gangguan jaringan saat menyimpan status aplikasi.',
@@ -124,12 +124,14 @@ export const AppStatusModal: React.FC<AppStatusModalProps> = ({
         showToast(res.error || 'Gagal memperbarui status aplikasi ke Cloud.', 'error');
         return;
       }
-      showToast(
-        isActive
-          ? 'Aplikasi telah diaktifkan kembali untuk seluruh pengguna!'
-          : 'Aplikasi berhasil dinonaktifkan. Pengguna non-admin akan melihat pesan penonaktifan.',
-        isActive ? 'success' : 'info'
-      );
+      if (!res || res.success) {
+        showToast(
+          isActive
+            ? 'Aplikasi telah diaktifkan kembali untuk seluruh pengguna!'
+            : 'Aplikasi berhasil dinonaktifkan. Pengguna non-admin akan melihat pesan penonaktifan.',
+          isActive ? 'success' : 'info'
+        );
+      }
       onClose();
     } catch (err: any) {
       console.error(err);

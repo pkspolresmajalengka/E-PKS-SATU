@@ -109,6 +109,10 @@
           "type": "boolean",
           "description": "Penanda akun tambahan mandiri"
         },
+        "schoolProfile": {
+          "type": "object",
+          "description": "Data profil lengkap pangkalan sekolah (NPSN, status sekolah, alamat, kecamatan, kabupaten, kode pos, kepala sekolah, NIP, email sekolah, telepon sekolah, motto, dan logo sekolah)"
+        },
         "updatedAt": {
           "type": "string",
           "description": "Waktu pembaruan"
@@ -206,7 +210,7 @@
     },
     "RegistrationSubmission": {
       "title": "RegistrationSubmission",
-      "description": "Pengajuan berkas 4 formulir pendaftaran PKS resmi",
+      "description": "Pengajuan berkas 4 formulir pendaftaran PKS resmi beserta NIPP Polisi Pelajar dan pelacakan pembayaran Cash/Cicilan",
       "type": "object",
       "properties": {
         "id": {
@@ -234,6 +238,52 @@
           "description": "Tanggal pendaftaran",
           "maxLength": 50
         },
+        "nomorIndukPoljar": {
+          "type": "string",
+          "description": "Nomor Induk Polisi Pelajar (PP-YYYY-AA-DDMMYYYY)",
+          "maxLength": 64
+        },
+        "nippStatus": {
+          "type": "string",
+          "description": "Status keaktifan NIPP Polisi Pelajar",
+          "enum": ["pending_payment", "active"]
+        },
+        "tahunAngkatan": {
+          "type": "string",
+          "description": "Tahun angkatan yang diatur Admin",
+          "maxLength": 10
+        },
+        "angkatan": {
+          "type": "string",
+          "description": "Nomor angkatan yang diatur Admin",
+          "maxLength": 10
+        },
+        "paymentPlan": {
+          "type": "string",
+          "description": "Skema pembayaran pendaftaran",
+          "enum": ["cash", "installment"]
+        },
+        "paymentStatus": {
+          "type": "string",
+          "description": "Status pembayaran pendaftaran",
+          "enum": ["unpaid", "partial", "pending_verification", "paid", "rejected"]
+        },
+        "feeAmount": {
+          "type": "number",
+          "description": "Total biaya pendaftaran"
+        },
+        "paidAmount": {
+          "type": "number",
+          "description": "Nominal total yang sudah terbayar dan terverifikasi"
+        },
+        "remainingAmount": {
+          "type": "number",
+          "description": "Sisa tagihan pembayaran"
+        },
+        "installmentHistory": {
+          "type": "array",
+          "description": "Riwayat pembayaran DP / cicilan / pelunasan"
+        },
         "data": {
           "type": "object",
           "description": "Rincian isi formulir pendaftaran"
@@ -244,6 +294,140 @@
         }
       },
       "required": ["id", "formType", "schoolName"]
+    },
+    "CerdasCermatConfig": {
+      "title": "CerdasCermatConfig",
+      "description": "Pengaturan paket soal dan status buka/tutup Lomba Cerdas Cermat yang dikelola Admin",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Identifier dokumen konfigurasi (cerdas_cermat_config)",
+          "maxLength": 64
+        },
+        "title": {
+          "type": "string",
+          "description": "Judul paket soal Lomba Cerdas Cermat",
+          "maxLength": 200
+        },
+        "description": {
+          "type": "string",
+          "description": "Petunjuk pengerjaan soal untuk akun sekolah",
+          "maxLength": 2000
+        },
+        "isOpen": {
+          "type": "boolean",
+          "description": "Menentukan apakah formulir soal terbuka untuk dijawab oleh sekolah"
+        },
+        "questions": {
+          "type": "array",
+          "description": "Daftar butir soal pilihan ganda dan isian/esai beserta bobot poin dan kunci jawaban"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Waktu terakhir paket soal diperbarui"
+        },
+        "updatedBy": {
+          "type": "string",
+          "description": "Username admin yang memperbarui paket soal",
+          "maxLength": 100
+        }
+      },
+      "required": ["id", "title", "isOpen"]
+    },
+    "CerdasCermatSubmission": {
+      "title": "CerdasCermatSubmission",
+      "description": "Kiriman jawaban Lomba Cerdas Cermat dari akun sekolah beserta hasil penilaian Admin",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "ID kiriman deterministik berbasis username sekolah (cc_<username>)",
+          "maxLength": 128
+        },
+        "schoolUsername": {
+          "type": "string",
+          "description": "Username akun sekolah pengirim jawaban",
+          "maxLength": 100
+        },
+        "schoolName": {
+          "type": "string",
+          "description": "Nama resmi pangkalan sekolah",
+          "maxLength": 150
+        },
+        "schoolLevel": {
+          "type": "string",
+          "description": "Jenjang pendidikan sekolah",
+          "enum": ["SLTP", "SLTA"]
+        },
+        "submittedByName": {
+          "type": "string",
+          "description": "Nama perwakilan pengirim pada akun sekolah",
+          "maxLength": 150
+        },
+        "participantId": {
+          "type": "string",
+          "description": "ID peserta lomba tujuan sinkronisasi nilai di Rekap Utama",
+          "maxLength": 128
+        },
+        "participantLabel": {
+          "type": "string",
+          "description": "Label peserta tujuan sinkronisasi",
+          "maxLength": 200
+        },
+        "answers": {
+          "type": "object",
+          "description": "Peta jawaban sekolah per ID soal (pilihan ganda & isian/esai)"
+        },
+        "questionGrades": {
+          "type": "object",
+          "description": "Peta nilai per butir soal dan catatan koreksi dari Admin"
+        },
+        "autoMcScore": {
+          "type": "number",
+          "description": "Total skor butir pilihan ganda"
+        },
+        "essayScore": {
+          "type": "number",
+          "description": "Total skor butir isian/esai"
+        },
+        "totalScore": {
+          "type": "number",
+          "description": "Skor akhir resmi Lomba Cerdas Cermat"
+        },
+        "maxPossibleScore": {
+          "type": "number",
+          "description": "Total poin maksimal dari soal yang dikerjakan"
+        },
+        "status": {
+          "type": "string",
+          "description": "Status penilaian kiriman sekolah",
+          "enum": ["submitted", "graded"]
+        },
+        "adminNote": {
+          "type": "string",
+          "description": "Catatan koreksi keseluruhan dari Admin",
+          "maxLength": 1000
+        },
+        "gradedBy": {
+          "type": "string",
+          "description": "Nama atau username admin penilai",
+          "maxLength": 150
+        },
+        "gradedAt": {
+          "type": "string",
+          "description": "Waktu pengesahan nilai oleh Admin"
+        },
+        "submittedAt": {
+          "type": "string",
+          "description": "Waktu pengiriman jawaban oleh sekolah"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Waktu pembaruan terakhir"
+        }
+      },
+      "required": ["id", "schoolUsername", "schoolName", "schoolLevel", "status"]
     }
   },
   "firestore": {
@@ -269,13 +453,19 @@
       "schema": {
         "$ref": "#/entities/AppLogo"
       },
-      "description": "Pengaturan aplikasi global (global_logo, app_status, payment_config, dan blanko_config)"
+      "description": "Pengaturan aplikasi global (global_logo, app_status, payment_config, blanko_config, dan cerdas_cermat_config)"
     },
     "/registrations/{registrationId}": {
       "schema": {
         "$ref": "#/entities/RegistrationSubmission"
       },
       "description": "Formulir pendaftaran digital 4 jenis kegiatan PKS"
+    },
+    "/cerdas_cermat_submissions/{submissionId}": {
+      "schema": {
+        "$ref": "#/entities/CerdasCermatSubmission"
+      },
+      "description": "Koleksi jawaban Lomba Cerdas Cermat per akun sekolah beserta penilaian Admin"
     }
   }
 }

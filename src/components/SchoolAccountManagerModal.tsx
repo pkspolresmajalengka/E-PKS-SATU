@@ -232,7 +232,7 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
       };
 
       const userSyncRes = await saveUserToCloud(newSchoolUser);
-      if (!userSyncRes.success && !userSyncRes.queuedOffline) {
+      if (!userSyncRes.success && !userSyncRes.queuedOffline && !userSyncRes.isQuotaError) {
         setNetworkError({
           title: 'Gagal Menyimpan Akun Sekolah ke Cloud',
           message: userSyncRes.error || 'Terjadi gangguan jaringan saat menyimpan akun sekolah.',
@@ -292,10 +292,12 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
       }
 
       showToast(
-        userSyncRes.queuedOffline
+        userSyncRes.isQuotaError
+          ? `Akun sekolah "${school}" diamankan di Cadangan Server & lokal (kuota Cloud penuh).`
+          : userSyncRes.queuedOffline
           ? `Akun sekolah "${school}" disimpan offline & akan otomatis tersinkron saat online.`
           : `Akun sekolah "${school}" berhasil dibuat & tersinkron ke Cloud!`,
-        userSyncRes.queuedOffline ? 'info' : 'success'
+        userSyncRes.queuedOffline || userSyncRes.isQuotaError ? 'info' : 'success'
       );
       resetForm();
       setActiveTab('list');
@@ -340,6 +342,10 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
       return;
     }
 
+    const existingSchoolUser = usersList.find(
+      u => u.username.toLowerCase() === editingTargetUsername.toLowerCase()
+    );
+
     const updatedUser: AppUser = {
       username: uname,
       password: pwd,
@@ -349,13 +355,14 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
       schoolLevel: formData.schoolLevel,
       pembinaName: formData.pembinaName.trim(),
       contactWa: formData.contactWa.trim(),
-      isCustom: true
+      isCustom: true,
+      ...(existingSchoolUser?.schoolProfile ? { schoolProfile: existingSchoolUser.schoolProfile } : {})
     };
 
     setIsSaving(true);
     const runUpdateSave = async () => {
       const syncRes = await saveUserToCloud(updatedUser);
-      if (!syncRes.success && !syncRes.queuedOffline) {
+      if (!syncRes.success && !syncRes.queuedOffline && !syncRes.isQuotaError) {
         setNetworkError({
           title: 'Gagal Memperbarui Akun Sekolah di Cloud',
           message: syncRes.error || 'Terjadi gangguan jaringan saat menyimpan perubahan akun sekolah.',
@@ -390,7 +397,14 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
         sessionStorage.setItem('PBB_PKS_ACTIVE_AUTH_SESSION', JSON.stringify(updatedUser));
       }
 
-      showToast(`Data akun sekolah "${school}" berhasil diperbarui & tersinkron ke Cloud!`, 'success');
+      showToast(
+        syncRes.isQuotaError
+          ? `Data akun sekolah "${school}" diamankan di Cadangan Server & lokal (kuota Cloud penuh).`
+          : syncRes.queuedOffline
+          ? `Data akun sekolah "${school}" disimpan offline & akan tersinkron saat online.`
+          : `Data akun sekolah "${school}" berhasil diperbarui & tersinkron ke Cloud!`,
+        syncRes.queuedOffline || syncRes.isQuotaError ? 'info' : 'success'
+      );
       resetForm();
       setActiveTab('list');
     };
@@ -409,7 +423,7 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
 
     try {
       const delRes = await deleteUserFromCloud(user.username);
-      if (!delRes.success && !delRes.queuedOffline) {
+      if (!delRes.success && !delRes.queuedOffline && !delRes.isQuotaError) {
         setConfirmDeleteUser(null);
         setNetworkError({
           title: 'Gagal Menghapus Akun Sekolah dari Cloud',
@@ -429,7 +443,14 @@ export const SchoolAccountManagerModal: React.FC<SchoolAccountManagerModalProps>
         // ignore
       }
       setConfirmDeleteUser(null);
-      showToast(`Akun sekolah "${school}" berhasil dihapus dari Cloud.`, 'info');
+      showToast(
+        delRes.isQuotaError
+          ? `Penghapusan akun "${school}" diamankan di Cadangan Server & antrean delta (kuota Cloud penuh).`
+          : delRes.queuedOffline
+          ? `Penghapusan akun "${school}" disimpan offline & akan tersinkron saat online.`
+          : `Akun sekolah "${school}" berhasil dihapus dari Cloud.`,
+        'info'
+      );
     } finally {
       setDeletingUsername(null);
     }

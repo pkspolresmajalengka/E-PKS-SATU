@@ -41,6 +41,12 @@ service cloud.firestore {
       allow write: if isValidId(registrationId);
     }
 
+    // Lomba Cerdas Cermat (Kiriman Sekolah & Penilaian Admin)
+    match /cerdas_cermat_submissions/{submissionId} {
+      allow read: if true;
+      allow write: if isValidId(submissionId);
+    }
+
     // Legacy activity_logs collection (disabled for new writes; read & delete allowed only for automatic cleanup)
     match /activity_logs/{logId} {
       allow read: if true;

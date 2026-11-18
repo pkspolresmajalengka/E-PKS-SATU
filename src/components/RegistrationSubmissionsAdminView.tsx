@@ -94,32 +94,63 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
     }
   };
 
+  // Helper for installment/cash amounts
+  const getPaymentAmounts = (s: RegistrationSubmission) => {
+    const totalFee = Number(s.feeAmount || 0);
+    const paid =
+      s.paidAmount !== undefined
+        ? Number(s.paidAmount)
+        : s.paymentStatus === 'paid' || s.stage1Finance?.status === 'approved'
+        ? totalFee
+        : 0;
+    const remaining =
+      s.remainingAmount !== undefined ? Number(s.remainingAmount) : Math.max(0, totalFee - paid);
+    const pendingItems = Array.isArray(s.installmentHistory)
+      ? s.installmentHistory.filter(item => item.status === 'pending_verification')
+      : [];
+    const pendingFromHistory = pendingItems.reduce((sum, item) => sum + Number(item.amount || 0), 0);
+    const pendingAmt =
+      Number(s.pendingPaymentAmount || 0) > 0
+        ? Number(s.pendingPaymentAmount)
+        : pendingFromHistory > 0
+        ? pendingFromHistory
+        : s.paymentStatus === 'pending_verification'
+        ? Math.max(0, totalFee - paid)
+        : 0;
+    const hasPendingFinance =
+      s.stage1Finance?.status === 'pending' ||
+      (s.paymentStatus === 'pending_verification' && pendingAmt > 0);
+    return { totalFee, paid, remaining, pendingAmt, hasPendingFinance };
+  };
+
   // Metrics computation
   const stats = useMemo(() => {
     let total = submissionsList.length;
     let unpaid = 0;
+    let partial = 0;
     let pendingFinance = 0;
     let pendingCommittee = 0;
     let fullyApproved = 0;
     let totalRevenue = 0;
 
     submissionsList.forEach(s => {
+      const { paid, hasPendingFinance } = getPaymentAmounts(s);
       if (s.paymentStatus === 'unpaid') unpaid++;
-      if (s.stage1Finance?.status === 'pending') pendingFinance++;
+      if (s.paymentStatus === 'partial') partial++;
+      if (hasPendingFinance) pendingFinance++;
       if (s.stage1Finance?.status === 'approved' && s.stage2Committee?.status === 'pending') {
         pendingCommittee++;
       }
       if (s.stage1Finance?.status === 'approved' && s.stage2Committee?.status === 'approved') {
         fullyApproved++;
       }
-      if (s.paymentStatus === 'paid' || s.stage1Finance?.status === 'approved') {
-        totalRevenue += s.feeAmount || 0;
-      }
+      totalRevenue += paid;
     });
 
     return {
       total,
       unpaid,
+      partial,
       pendingFinance,
       pendingCommittee,
       fullyApproved,
@@ -134,23 +165,31 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
       const matchStudentArray =
         Array.isArray(s.formData?.students) &&
         s.formData.students.some((st: any) => (st?.nama || '').toLowerCase().includes(q));
+      const matchCampParticipants =
+        Array.isArray(s.formData?.participants) &&
+        s.formData.participants.some((pt: any) => (pt?.nama || '').toLowerCase().includes(q));
       const matchSearch =
         !q ||
         s.schoolName?.toLowerCase().includes(q) ||
         s.applicantName?.toLowerCase().includes(q) ||
         s.id?.toLowerCase().includes(q) ||
+        s.nomorIndukPoljar?.toLowerCase().includes(q) ||
         s.formData?.nisn?.includes(q) ||
         s.formData?.noHp?.includes(q) ||
-        matchStudentArray;
+        matchStudentArray ||
+        matchCampParticipants;
 
       const matchForm = filterFormType === 'all' || s.formType === filterFormType;
       const matchLevel = filterLevel === 'all' || s.schoolLevel === filterLevel;
+      const { hasPendingFinance } = getPaymentAmounts(s);
 
       let matchStatus = true;
       if (filterStatus === 'unpaid') {
         matchStatus = s.paymentStatus === 'unpaid';
+      } else if (filterStatus === 'partial') {
+        matchStatus = s.paymentStatus === 'partial';
       } else if (filterStatus === 'pending_finance') {
-        matchStatus = s.stage1Finance?.status === 'pending';
+        matchStatus = hasPendingFinance;
       } else if (filterStatus === 'pending_committee') {
         matchStatus = s.stage1Finance?.status === 'approved' && s.stage2Committee?.status === 'pending';
       } else if (filterStatus === 'fully_approved') {
@@ -169,7 +208,7 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
     setSelectedSubmission(sub);
     setVerifyModalType('stage1');
     setVerifyActionStatus('approved');
-    setVerifyNote(sub.stage1Finance?.note || '');
+    setVerifyNote('');
   };
 
   // Open Stage 2 Verification
@@ -181,6 +220,7 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
     setVerifyNote(sub.stage2Committee?.note || '');
     setOfficialNumberInput(
       sub.stage2Committee?.officialNumber ||
+      sub.nomorIndukPoljar ||
       `REG-${sub.schoolLevel}-${String(Math.floor(Math.random() * 900) + 100)}`
     );
   };
@@ -203,17 +243,77 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
       let updatedSub: RegistrationSubmission = { ...selectedSubmission };
 
       if (verifyModalType === 'stage1') {
-        updatedSub.stage1Finance = {
-          status: verifyActionStatus,
-          verifiedBy: verifierName,
-          verifiedAt: nowStr,
-          note: verifyNote.trim()
-        };
+        const { totalFee, paid: prevPaid, pendingAmt } = getPaymentAmounts(selectedSubmission);
+        const existingHistory = Array.isArray(selectedSubmission.installmentHistory)
+          ? [...selectedSubmission.installmentHistory]
+          : [];
+
         if (verifyActionStatus === 'approved') {
-          updatedSub.paymentStatus = 'paid';
+          const newPaidAmount = Math.min(totalFee, prevPaid + pendingAmt);
+          const newRemainingAmount = Math.max(0, totalFee - newPaidAmount);
+          const updatedHistory = existingHistory.map(item =>
+            item.status === 'pending_verification'
+              ? {
+                  ...item,
+                  status: 'approved' as const,
+                  verifiedBy: verifierName,
+                  verifiedAt: nowStr,
+                  note: verifyNote.trim() || item.note
+                }
+              : item
+          );
+
+          updatedSub.stage1Finance = {
+            status: 'approved',
+            verifiedBy: verifierName,
+            verifiedAt: nowStr,
+            note: verifyNote.trim()
+          };
+          updatedSub.paidAmount = newPaidAmount;
+          updatedSub.remainingAmount = newRemainingAmount;
+          updatedSub.pendingPaymentAmount = 0;
+          updatedSub.installmentHistory = updatedHistory;
+          updatedSub.paymentStatus = newRemainingAmount <= 0 ? 'paid' : 'partial';
           updatedSub.paymentDate = nowStr;
+
+          if (selectedSubmission.formType === 'polisi_pelajar' || selectedSubmission.nomorIndukPoljar) {
+            updatedSub.nippStatus = 'active';
+          }
         } else {
-          updatedSub.paymentStatus = 'rejected';
+          const updatedHistory = existingHistory.map(item =>
+            item.status === 'pending_verification'
+              ? {
+                  ...item,
+                  status: 'rejected' as const,
+                  verifiedBy: verifierName,
+                  verifiedAt: nowStr,
+                  note: verifyNote.trim() || item.note
+                }
+              : item
+          );
+          updatedSub.pendingPaymentAmount = 0;
+          updatedSub.installmentHistory = updatedHistory;
+
+          if (prevPaid > 0) {
+            // Retain previously approved DP/installment & keep NIPP active
+            updatedSub.paymentStatus = 'partial';
+            updatedSub.stage1Finance = {
+              status: 'approved',
+              verifiedBy: selectedSubmission.stage1Finance?.verifiedBy || verifierName,
+              verifiedAt: selectedSubmission.stage1Finance?.verifiedAt || nowStr,
+              note: verifyNote.trim()
+                ? `Cicilan lanjutan ditolak: ${verifyNote.trim()}`
+                : selectedSubmission.stage1Finance?.note
+            };
+          } else {
+            updatedSub.paymentStatus = 'rejected';
+            updatedSub.stage1Finance = {
+              status: 'rejected',
+              verifiedBy: verifierName,
+              verifiedAt: nowStr,
+              note: verifyNote.trim()
+            };
+          }
         }
       } else if (verifyModalType === 'stage2') {
         updatedSub.stage2Committee = {
@@ -228,7 +328,7 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
       updatedSub.updatedAt = new Date().toISOString();
 
       const res = await saveRegistrationToCloud(updatedSub);
-      if (!res.success && !res.queuedOffline) {
+      if (!res.success && !res.queuedOffline && !res.isQuotaError) {
         setVerifyNetworkError({
           title: 'Gagal Menyimpan Verifikasi Berkas ke Cloud',
           message: res.error || 'Gangguan jaringan saat menyimpan keputusan verifikasi.',
@@ -242,12 +342,14 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
       setSelectedSubmission(updatedSub);
       setVerifyModalType(null);
       showToast(
-        res.queuedOffline
+        res.isQuotaError
+          ? 'Verifikasi diamankan di Cadangan Server & antrean delta (kuota Cloud penuh).'
+          : res.queuedOffline
           ? 'Verifikasi disimpan offline & akan otomatis tersinkron ke Cloud saat online.'
           : verifyModalType === 'stage1'
           ? `Verifikasi Keuangan (Tahap 1) berhasil disimpan!`
           : `Pengesahan Panitia (Tahap 2) berhasil disimpan!`,
-        res.queuedOffline ? 'info' : 'success'
+        res.queuedOffline || res.isQuotaError ? 'info' : 'success'
       );
     } catch (err: any) {
       setVerifyNetworkError({
@@ -268,7 +370,7 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
     setListNetworkError(null);
     try {
       const res = await deleteRegistrationFromCloud(id);
-      if (!res.success && !res.queuedOffline) {
+      if (!res.success && !res.queuedOffline && !res.isQuotaError) {
         setConfirmDeleteTarget(null);
         setListNetworkError({
           title: 'Gagal Menghapus Berkas Pendaftaran dari Cloud',
@@ -285,7 +387,9 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
       }
       setConfirmDeleteTarget(null);
       showToast(
-        res.queuedOffline
+        res.isQuotaError
+          ? 'Penghapusan berkas diamankan di Cadangan Server & antrean delta (kuota Cloud penuh).'
+          : res.queuedOffline
           ? 'Penghapusan berkas disimpan offline & otomatis dikirim ke Cloud saat online.'
           : 'Berkas pendaftaran berhasil dihapus dari Cloud.',
         'info'
@@ -315,30 +419,64 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
       return;
     }
 
-    const rows = filteredSubmissions.map((s, idx) => ({
-      'No': idx + 1,
-      'ID Registrasi': s.id,
-      'Tanggal Input': s.createdAt ? new Date(s.createdAt).toLocaleDateString('id-ID') : '-',
-      'Jenis Formulir': getFormLabel(s.formType),
-      'Asal Sekolah': s.schoolName,
-      'Jenjang': s.schoolLevel,
-      'Nama Pendaftar': s.applicantName,
-      'Jumlah Siswa': Array.isArray(s.formData?.students) ? s.formData.students.length : 1,
-      'Daftar Siswa': Array.isArray(s.formData?.students)
-        ? s.formData.students
-            .map((st: any, i: number) => `${i + 1}. ${st?.nama || '-'} (${st?.tempatLahir || '-'}, ${st?.tanggalLahir || '-'} - ${st?.jk || '-'})`)
-            .join('; ')
-        : s.applicantName,
-      'No WhatsApp': s.contactWa || s.formData?.noHp || '-',
-      'Nominal Biaya': s.feeAmount || 0,
-      'Metode Bayar': s.paymentMethod?.toUpperCase() || '-',
-      'Status Pembayaran': s.paymentStatus === 'paid' ? 'LUNAS' : s.paymentStatus === 'unpaid' ? 'BELUM BAYAR' : 'MENUNGGU VERIFIKASI',
-      'Verifikasi Keuangan (Tahap 1)': s.stage1Finance?.status === 'approved' ? 'DISETUJUI' : s.stage1Finance?.status === 'rejected' ? 'DITOLAK' : 'MENUNGGU',
-      'Petugas Keuangan': s.stage1Finance?.verifiedBy || '-',
-      'Pengesahan Panitia (Tahap 2)': s.stage2Committee?.status === 'approved' ? 'DISAHKAN' : s.stage2Committee?.status === 'rejected' ? 'DITOLAK' : 'MENUNGGU',
-      'Petugas Panitia': s.stage2Committee?.verifiedBy || '-',
-      'Nomor Peserta Resmi': s.stage2Committee?.officialNumber || '-'
-    }));
+    const rows = filteredSubmissions.map((s, idx) => {
+      const { totalFee, paid, remaining } = getPaymentAmounts(s);
+      return {
+        'No': idx + 1,
+        'ID Registrasi': s.id,
+        'Tanggal Input': s.createdAt ? new Date(s.createdAt).toLocaleDateString('id-ID') : '-',
+        'Jenis Formulir': getFormLabel(s.formType),
+        'Asal Sekolah': s.schoolName,
+        'Jenjang': s.schoolLevel,
+        'Nama Pendaftar': s.applicantName,
+        'NIPP (Polisi Pelajar)': s.nomorIndukPoljar || '-',
+        'Status NIPP': s.nomorIndukPoljar
+          ? s.nippStatus === 'active'
+            ? 'AKTIF'
+            : 'MENUNGGU BAYAR'
+          : '-',
+        'Jumlah Siswa': Array.isArray(s.formData?.participants)
+          ? s.formData.participants.length
+          : Array.isArray(s.formData?.students)
+          ? s.formData.students.length
+          : 1,
+        'Include Konsumsi':
+          s.formData?.mealCount !== undefined
+            ? `${s.formData.mealCount} / ${s.formData.totalParticipants ?? s.formData.participants?.length ?? 0}`
+            : '-',
+        'Daftar Siswa': Array.isArray(s.formData?.participants)
+          ? s.formData.participants
+              .map((pt: any, i: number) => `${i + 1}. ${pt?.nama || '-'} (${pt?.jk || '-'})`)
+              .join('; ')
+          : Array.isArray(s.formData?.students)
+          ? s.formData.students
+              .map((st: any, i: number) => `${i + 1}. ${st?.nama || '-'} (${st?.tempatLahir || '-'}, ${st?.tanggalLahir || '-'} - ${st?.jk || '-'})`)
+              .join('; ')
+          : s.applicantName,
+        'No WhatsApp': s.contactWa || s.formData?.noHp || '-',
+        'Skema Pembayaran': s.formType === 'kemah_balok1' ? 'WAJIB CASH 100%' : s.paymentPlan === 'installment' ? 'CICILAN / DP' : 'CASH',
+        'Biaya Wajib Sekolah': s.formType === 'kemah_balok1' ? Number(s.formData?.schoolFeePerForm || 0) : 0,
+        'Total Biaya': totalFee,
+        'Sudah Terbayar': paid,
+        'Sisa Tagihan': remaining,
+        'Metode Bayar': s.paymentMethod?.toUpperCase() || '-',
+        'Status Pembayaran':
+          s.paymentStatus === 'paid'
+            ? 'LUNAS'
+            : s.paymentStatus === 'partial'
+            ? 'CICILAN AKTIF'
+            : s.paymentStatus === 'unpaid'
+            ? 'BELUM BAYAR'
+            : s.paymentStatus === 'rejected'
+            ? 'DITOLAK'
+            : 'MENUNGGU VERIFIKASI',
+        'Verifikasi Keuangan (Tahap 1)': s.stage1Finance?.status === 'approved' ? 'DISETUJUI' : s.stage1Finance?.status === 'rejected' ? 'DITOLAK' : 'MENUNGGU',
+        'Petugas Keuangan': s.stage1Finance?.verifiedBy || '-',
+        'Pengesahan Panitia (Tahap 2)': s.stage2Committee?.status === 'approved' ? 'DISAHKAN' : s.stage2Committee?.status === 'rejected' ? 'DITOLAK' : 'MENUNGGU',
+        'Petugas Panitia': s.stage2Committee?.verifiedBy || '-',
+        'Nomor Peserta Resmi': s.stage2Committee?.officialNumber || s.nomorIndukPoljar || '-'
+      };
+    });
 
     const wb = XLSX.utils.book_new();
     const ws = XLSX.utils.json_to_sheet(rows);
@@ -346,19 +484,28 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
       { wch: 6 },
       { wch: 20 },
       { wch: 14 },
-      { wch: 24 },
-      { wch: 30 },
+      { wch: 22 },
+      { wch: 28 },
       { wch: 10 },
-      { wch: 26 },
+      { wch: 24 },
+      { wch: 22 },
+      { wch: 18 },
+      { wch: 12 },
       { wch: 16 },
-      { wch: 16 },
+      { wch: 28 },
       { wch: 16 },
       { wch: 18 },
       { wch: 18 },
-      { wch: 20 },
+      { wch: 14 },
+      { wch: 14 },
+      { wch: 14 },
+      { wch: 16 },
       { wch: 18 },
-      { wch: 20 },
-      { wch: 20 }
+      { wch: 18 },
+      { wch: 16 },
+      { wch: 18 },
+      { wch: 16 },
+      { wch: 22 }
     ];
     XLSX.utils.book_append_sheet(wb, ws, 'Rekap_Pendaftaran_PKS');
     XLSX.writeFile(wb, `Rekap_Pendaftaran_PKS_Semua_Sekolah_${new Date().toISOString().slice(0, 10)}.xlsx`);
@@ -455,7 +602,9 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
           <span className="text-sm sm:text-base font-black text-emerald-700 font-mono mt-1 block truncate">
             {formatRupiah(stats.totalRevenue)}
           </span>
-          <span className="text-[10px] text-slate-400">Kas pendaftaran</span>
+          <span className="text-[10px] text-slate-400">
+            {stats.partial > 0 ? `${stats.partial} cicilan aktif` : 'Kas pendaftaran'}
+          </span>
         </div>
       </div>
 
@@ -469,7 +618,7 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
               type="text"
               value={searchQuery}
               onChange={e => setSearchQuery(e.target.value)}
-              placeholder="Cari nama sekolah, siswa, NISN, atau no HP..."
+              placeholder="Cari nama sekolah, siswa, NIPP, NISN, atau no HP..."
               className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded-xl text-xs focus:ring-2 focus:ring-blue-500 outline-none"
             />
           </div>
@@ -498,6 +647,7 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
             >
               <option value="all">Semua Status Pendaftaran</option>
               <option value="unpaid">Belum Dibayar</option>
+              <option value="partial">Cicilan Aktif (DP Terverifikasi)</option>
               <option value="pending_finance">Menunggu Verif Keuangan</option>
               <option value="pending_committee">Menunggu Verif Panitia</option>
               <option value="fully_approved">Sah & Disahkan 100%</option>
@@ -537,7 +687,7 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
               ) : (
                 filteredSubmissions.map((sub, idx) => {
                   const isStage1Approved = sub.stage1Finance?.status === 'approved';
-                  const isStage2Approved = sub.stage2Committee?.status === 'approved';
+                  const { totalFee, paid, remaining, pendingAmt, hasPendingFinance } = getPaymentAmounts(sub);
 
                   return (
                     <tr key={sub.id} className="hover:bg-slate-50/80 transition">
@@ -556,13 +706,45 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
 
                       <td className="py-3 px-3">
                         <div className="font-bold text-slate-900">{sub.applicantName}</div>
+                        {sub.nomorIndukPoljar && (
+                          <div className="mt-0.5 flex flex-wrap items-center gap-1">
+                            <span className="font-mono text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 text-slate-800">
+                              {sub.nomorIndukPoljar}
+                            </span>
+                            <span
+                              className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded ${
+                                sub.nippStatus === 'active'
+                                  ? 'bg-emerald-100 text-emerald-700'
+                                  : 'bg-amber-100 text-amber-700'
+                              }`}
+                            >
+                              {sub.nippStatus === 'active' ? 'NIPP Aktif' : 'NIPP Menunggu Bayar'}
+                            </span>
+                          </div>
+                        )}
                         {Array.isArray(sub.formData?.students) && sub.formData.students.length > 1 && (
                           <div className="text-[11px] text-blue-600 font-semibold">
                             {sub.formData.students.length} Siswa Terdaftar
                           </div>
                         )}
+                        {(sub.formType === 'kemah_balok1' || sub.formType === 'pks_balok2') &&
+                          sub.formData?.totalParticipants !== undefined && (
+                            <div className="mt-0.5 flex flex-wrap items-center gap-1 text-[10px] font-mono tabular-nums">
+                              {sub.formType === 'kemah_balok1' && Number(sub.formData?.schoolFeePerForm || 0) > 0 && (
+                                <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300 font-bold">
+                                  Sekolah: {formatRupiah(sub.formData.schoolFeePerForm)}
+                                </span>
+                              )}
+                              <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 font-bold">
+                                {sub.formData.maleCount ?? 0} L · {sub.formData.femaleCount ?? 0} P
+                              </span>
+                              <span className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 font-bold">
+                                Konsumsi: {sub.formData.mealCount ?? 0}
+                              </span>
+                            </div>
+                          )}
                         <div className="text-[11px] text-slate-500">
-                          {sub.contactWa || sub.formData?.noHp || '-'}
+                          {sub.contactWa || sub.formData?.nisn ? (sub.contactWa !== '-' && sub.contactWa ? sub.contactWa : `NISN: ${sub.formData?.nisn || '-'}`) : '-'}
                         </div>
                       </td>
 
@@ -576,9 +758,43 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
                       </td>
 
                       <td className="py-3 px-3">
-                        <div className="font-mono font-bold text-slate-900">
-                          {sub.feeAmount === 0 ? 'Gratis' : formatRupiah(sub.feeAmount)}
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-mono font-bold text-slate-900">
+                            {totalFee === 0 ? 'Gratis' : formatRupiah(totalFee)}
+                          </span>
+                          {totalFee > 0 && (
+                            <span
+                              className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded ${
+                                sub.formType === 'kemah_balok1'
+                                  ? 'bg-amber-100 text-amber-900'
+                                  : sub.paymentPlan === 'installment'
+                                  ? 'bg-sky-100 text-sky-700'
+                                  : 'bg-slate-100 text-slate-600'
+                              }`}
+                            >
+                              {sub.formType === 'kemah_balok1'
+                                ? 'Wajib Cash'
+                                : sub.paymentPlan === 'installment'
+                                ? 'Cicilan'
+                                : 'Cash'}
+                            </span>
+                          )}
                         </div>
+                        {totalFee > 0 && (paid > 0 || remaining < totalFee || pendingAmt > 0) && (
+                          <div className="text-[10px] mt-0.5 space-y-0.5">
+                            {paid > 0 && (
+                              <div className="text-emerald-700 font-semibold font-mono">
+                                Masuk: {formatRupiah(paid)}
+                                {remaining > 0 ? ` · Sisa: ${formatRupiah(remaining)}` : ''}
+                              </div>
+                            )}
+                            {pendingAmt > 0 && (
+                              <div className="text-blue-700 font-bold font-mono">
+                                Pending Verif: {formatRupiah(pendingAmt)}
+                              </div>
+                            )}
+                          </div>
+                        )}
                         <div className="flex items-center gap-1 mt-0.5 text-[11px] text-slate-500">
                           <span className="capitalize">{sub.paymentMethod?.replace('_', ' ')}</span>
                           {sub.paymentProofUrl && (
@@ -595,10 +811,36 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
 
                       {/* Stage 1: Finance */}
                       <td className="py-3 px-3 text-center">
-                        {sub.stage1Finance?.status === 'approved' ? (
-                          <div className="inline-flex items-center gap-1 text-emerald-700 font-bold bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-lg text-[11px]">
-                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                            <span>Valid (Lunas)</span>
+                        {hasPendingFinance ? (
+                          isAdminViewer ? (
+                            <button
+                              type="button"
+                              onClick={() => handleOpenStage1(sub)}
+                              className="inline-flex items-center gap-1 text-blue-700 hover:text-blue-900 font-bold bg-blue-50 hover:bg-blue-100 border border-blue-200 px-2.5 py-1 rounded-lg text-[11px] transition cursor-pointer"
+                            >
+                              <Clock className="w-3.5 h-3.5 text-blue-500" />
+                              <span>{paid > 0 ? 'Verif Cicilan' : 'Verif Keuangan'}</span>
+                            </button>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 text-amber-700 font-semibold bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-lg text-[11px]">
+                              <Clock className="w-3.5 h-3.5 text-amber-500" />
+                              <span>{paid > 0 ? 'Menunggu Verif Cicilan' : 'Menunggu Keuangan'}</span>
+                            </span>
+                          )
+                        ) : sub.stage1Finance?.status === 'approved' ? (
+                          <div
+                            className={`inline-flex items-center gap-1 font-bold border px-2.5 py-1 rounded-lg text-[11px] ${
+                              remaining > 0
+                                ? 'text-sky-700 bg-sky-50 border-sky-200'
+                                : 'text-emerald-700 bg-emerald-50 border-emerald-200'
+                            }`}
+                          >
+                            <CheckCircle2
+                              className={`w-3.5 h-3.5 ${
+                                remaining > 0 ? 'text-sky-600' : 'text-emerald-600'
+                              }`}
+                            />
+                            <span>{remaining > 0 ? 'DP Valid (Cicilan)' : 'Valid (Lunas)'}</span>
                           </div>
                         ) : sub.stage1Finance?.status === 'rejected' ? (
                           <div className="inline-flex items-center gap-1 text-rose-700 font-bold bg-rose-50 border border-rose-200 px-2.5 py-1 rounded-lg text-[11px]">
@@ -729,7 +971,7 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
             {/* Modal Body */}
             <div className="p-5 overflow-y-auto space-y-5 text-xs">
               {/* Asal Sekolah & Status Box */}
-              <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl grid grid-cols-2 gap-3">
+              <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <span className="text-[10px] font-bold text-slate-500 uppercase block">Asal Sekolah</span>
                   <span className="text-sm font-bold text-slate-900">{selectedSubmission.schoolName}</span>
@@ -738,134 +980,322 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
                 <div>
                   <span className="text-[10px] font-bold text-slate-500 uppercase block">Pendaftar / Siswa</span>
                   <span className="text-sm font-bold text-slate-900">{selectedSubmission.applicantName}</span>
-                  <span className="text-[11px] text-slate-500 block mt-0.5">Kontak: {selectedSubmission.contactWa || '-'}</span>
-                </div>
-              </div>
-
-              {/* Status Pembayaran & 2-Tahap Verification */}
-              <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
-                <h4 className="font-bold text-slate-800 text-xs border-b border-slate-200 pb-1.5 flex items-center justify-between">
-                  <span>Status Pembayaran & Verifikasi 2-Tahap</span>
-                  <span className="font-mono text-emerald-700 font-bold">
-                    Biaya: {formatRupiah(selectedSubmission.feeAmount)}
+                  <span className="text-[11px] text-slate-500 block mt-0.5">
+                    {selectedSubmission.contactWa && selectedSubmission.contactWa !== '-'
+                      ? `Kontak: ${selectedSubmission.contactWa}`
+                      : `NISN: ${selectedSubmission.formData?.nisn || '-'}`}
                   </span>
-                </h4>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-                  {/* Tahap 1: Keuangan */}
-                  <div className="p-3 bg-white rounded-lg border border-slate-200 space-y-1">
-                    <span className="text-[10px] font-bold text-slate-500 uppercase block">Tahap 1: Admin Keuangan</span>
-                    <div className="flex items-center gap-1.5">
-                      {selectedSubmission.stage1Finance?.status === 'approved' ? (
-                        <span className="font-bold text-emerald-600 flex items-center gap-1">
-                          <CheckCircle2 className="w-3.5 h-3.5" /> Disetujui (Lunas)
-                        </span>
-                      ) : selectedSubmission.stage1Finance?.status === 'rejected' ? (
-                        <span className="font-bold text-rose-600 flex items-center gap-1">
-                          <XCircle className="w-3.5 h-3.5" /> Ditolak
-                        </span>
-                      ) : (
-                        <span className="font-bold text-amber-600 flex items-center gap-1">
-                          <Clock className="w-3.5 h-3.5" /> Menunggu Verifikasi
-                        </span>
-                      )}
-                    </div>
-                    {selectedSubmission.stage1Finance?.verifiedBy && (
-                      <p className="text-[11px] text-slate-500">
-                        Oleh: {selectedSubmission.stage1Finance.verifiedBy} ({selectedSubmission.stage1Finance.verifiedAt})
-                      </p>
-                    )}
-                    {selectedSubmission.stage1Finance?.note && (
-                      <p className="text-[11px] text-slate-600 italic mt-1 bg-slate-50 p-1.5 rounded">
-                        Catatan: "{selectedSubmission.stage1Finance.note}"
-                      </p>
-                    )}
-                    {isAdminViewer && selectedSubmission.stage1Finance?.status !== 'approved' && (
-                      <button
-                        type="button"
-                        onClick={() => handleOpenStage1(selectedSubmission)}
-                        className="mt-2 w-full py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold text-xs transition cursor-pointer"
-                      >
-                        Verifikasi Keuangan Sekarang
-                      </button>
-                    )}
-                  </div>
-
-                  {/* Tahap 2: Panitia */}
-                  <div className="p-3 bg-white rounded-lg border border-slate-200 space-y-1">
-                    <span className="text-[10px] font-bold text-slate-500 uppercase block">Tahap 2: Panitia Pelaksana</span>
-                    <div className="flex items-center gap-1.5">
-                      {selectedSubmission.stage2Committee?.status === 'approved' ? (
-                        <span className="font-bold text-emerald-600 flex items-center gap-1">
-                          <Shield className="w-3.5 h-3.5" /> Disahkan Resmi
-                        </span>
-                      ) : selectedSubmission.stage2Committee?.status === 'rejected' ? (
-                        <span className="font-bold text-rose-600 flex items-center gap-1">
-                          <XCircle className="w-3.5 h-3.5" /> Ditolak
-                        </span>
-                      ) : (
-                        <span className="font-bold text-amber-600 flex items-center gap-1">
-                          <Clock className="w-3.5 h-3.5" /> Menunggu Pengesahan
-                        </span>
-                      )}
-                    </div>
-                    {selectedSubmission.stage2Committee?.officialNumber && (
-                      <p className="text-[11px] font-mono font-bold text-slate-800">
-                        No. Registrasi: {selectedSubmission.stage2Committee.officialNumber}
-                      </p>
-                    )}
-                    {selectedSubmission.stage2Committee?.verifiedBy && (
-                      <p className="text-[11px] text-slate-500">
-                        Oleh: {selectedSubmission.stage2Committee.verifiedBy} ({selectedSubmission.stage2Committee.verifiedAt})
-                      </p>
-                    )}
-                    {isAdminViewer &&
-                      selectedSubmission.stage1Finance?.status === 'approved' &&
-                      selectedSubmission.stage2Committee?.status !== 'approved' && (
-                        <button
-                          type="button"
-                          onClick={() => handleOpenStage2(selectedSubmission)}
-                          className="mt-2 w-full py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold text-xs transition cursor-pointer"
-                        >
-                          Sahkan Berkas Panitia
-                        </button>
-                      )}
-                  </div>
                 </div>
-
-                {/* Bukti Bayar Preview if any */}
-                {selectedSubmission.paymentProofUrl && (
-                  <div className="pt-2 border-t border-slate-200">
-                    <span className="text-[11px] font-bold text-slate-700 block mb-1.5">Foto Bukti Transfer:</span>
-                    <div className="flex items-center gap-3">
-                      <img
-                        src={selectedSubmission.paymentProofUrl}
-                        alt="Bukti Transfer"
-                        onClick={() => setZoomProofUrl(selectedSubmission.paymentProofUrl!)}
-                        className="w-24 h-24 object-cover rounded-xl border border-slate-200 shadow-xs cursor-pointer hover:opacity-90"
-                      />
-                      <div className="text-xs text-slate-500">
-                        <button
-                          type="button"
-                          onClick={() => setZoomProofUrl(selectedSubmission.paymentProofUrl!)}
-                          className="text-blue-600 hover:text-blue-800 font-bold underline cursor-pointer"
-                        >
-                          Klik untuk memperbesar foto struk transfer
-                        </button>
-                        <p className="text-[11px] text-slate-400 mt-1">
-                          Metode: {selectedSubmission.paymentMethod?.toUpperCase()}
-                        </p>
-                      </div>
+                {selectedSubmission.nomorIndukPoljar && (
+                  <div className="sm:col-span-2 pt-2.5 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <span className="text-[10px] font-bold text-slate-500 uppercase block">
+                        Nomor Induk Polisi Pelajar (NIPP)
+                      </span>
+                      <span className="font-mono text-sm font-black text-slate-900">
+                        {selectedSubmission.nomorIndukPoljar}
+                      </span>
+                      {(selectedSubmission.tahunAngkatan || selectedSubmission.angkatan) && (
+                        <span className="text-[11px] text-slate-500 ml-2">
+                          (Tahun {selectedSubmission.tahunAngkatan || '-'} · Angkatan {selectedSubmission.angkatan || '-'})
+                        </span>
+                      )}
                     </div>
+                    <span
+                      className={`px-2.5 py-1 rounded-lg text-[10px] font-black uppercase ${
+                        selectedSubmission.nippStatus === 'active'
+                          ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                          : 'bg-amber-100 text-amber-800 border border-amber-200'
+                      }`}
+                    >
+                      {selectedSubmission.nippStatus === 'active'
+                        ? 'NIPP Aktif'
+                        : 'NIPP Menunggu Verifikasi Bayar'}
+                    </span>
                   </div>
                 )}
               </div>
+
+              {/* Status Pembayaran & 2-Tahap Verification */}
+              {(() => {
+                const { totalFee, paid, remaining, pendingAmt, hasPendingFinance } =
+                  getPaymentAmounts(selectedSubmission);
+                return (
+                  <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+                    <h4 className="font-bold text-slate-800 text-xs border-b border-slate-200 pb-1.5 flex flex-wrap items-center justify-between gap-2">
+                      <span>Status Pembayaran & Verifikasi 2-Tahap</span>
+                      <span className="font-mono text-emerald-700 font-bold">
+                        Total Biaya: {formatRupiah(totalFee)} ({selectedSubmission.paymentPlan === 'installment' ? 'Cicilan' : 'Cash'})
+                      </span>
+                    </h4>
+
+                    {totalFee > 0 && (
+                      <div className="grid grid-cols-3 gap-2 text-center bg-white p-2.5 rounded-xl border border-slate-200">
+                        <div>
+                          <span className="text-[10px] font-bold text-slate-400 uppercase block">Sudah Terbayar</span>
+                          <span className="font-mono font-black text-emerald-700 text-xs">
+                            {formatRupiah(paid)}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="text-[10px] font-bold text-slate-400 uppercase block">Sisa Tagihan</span>
+                          <span className="font-mono font-black text-rose-600 text-xs">
+                            {formatRupiah(remaining)}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="text-[10px] font-bold text-slate-400 uppercase block">Menunggu Verif</span>
+                          <span className="font-mono font-black text-blue-600 text-xs">
+                            {formatRupiah(pendingAmt)}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                      {/* Tahap 1: Keuangan */}
+                      <div className="p-3 bg-white rounded-lg border border-slate-200 space-y-1">
+                        <span className="text-[10px] font-bold text-slate-500 uppercase block">Tahap 1: Admin Keuangan</span>
+                        <div className="flex items-center gap-1.5">
+                          {hasPendingFinance ? (
+                            <span className="font-bold text-amber-600 flex items-center gap-1">
+                              <Clock className="w-3.5 h-3.5" />
+                              {paid > 0 ? 'Ada Pembayaran Cicilan Pending' : 'Menunggu Verifikasi'}
+                            </span>
+                          ) : selectedSubmission.stage1Finance?.status === 'approved' ? (
+                            <span className="font-bold text-emerald-600 flex items-center gap-1">
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              {remaining > 0 ? 'DP Valid (Cicilan Aktif)' : 'Disetujui (Lunas)'}
+                            </span>
+                          ) : selectedSubmission.stage1Finance?.status === 'rejected' ? (
+                            <span className="font-bold text-rose-600 flex items-center gap-1">
+                              <XCircle className="w-3.5 h-3.5" /> Ditolak
+                            </span>
+                          ) : (
+                            <span className="font-bold text-amber-600 flex items-center gap-1">
+                              <Clock className="w-3.5 h-3.5" /> Menunggu Verifikasi
+                            </span>
+                          )}
+                        </div>
+                        {selectedSubmission.stage1Finance?.verifiedBy && (
+                          <p className="text-[11px] text-slate-500">
+                            Oleh: {selectedSubmission.stage1Finance.verifiedBy} ({selectedSubmission.stage1Finance.verifiedAt})
+                          </p>
+                        )}
+                        {selectedSubmission.stage1Finance?.note && (
+                          <p className="text-[11px] text-slate-600 italic mt-1 bg-slate-50 p-1.5 rounded">
+                            Catatan: "{selectedSubmission.stage1Finance.note}"
+                          </p>
+                        )}
+                        {isAdminViewer && (selectedSubmission.stage1Finance?.status !== 'approved' || hasPendingFinance) && (
+                          <button
+                            type="button"
+                            onClick={() => handleOpenStage1(selectedSubmission)}
+                            className="mt-2 w-full py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold text-xs transition cursor-pointer"
+                          >
+                            {paid > 0 ? 'Verifikasi Cicilan Sekarang' : 'Verifikasi Keuangan Sekarang'}
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Tahap 2: Panitia */}
+                      <div className="p-3 bg-white rounded-lg border border-slate-200 space-y-1">
+                        <span className="text-[10px] font-bold text-slate-500 uppercase block">Tahap 2: Panitia Pelaksana</span>
+                        <div className="flex items-center gap-1.5">
+                          {selectedSubmission.stage2Committee?.status === 'approved' ? (
+                            <span className="font-bold text-emerald-600 flex items-center gap-1">
+                              <Shield className="w-3.5 h-3.5" /> Disahkan Resmi
+                            </span>
+                          ) : selectedSubmission.stage2Committee?.status === 'rejected' ? (
+                            <span className="font-bold text-rose-600 flex items-center gap-1">
+                              <XCircle className="w-3.5 h-3.5" /> Ditolak
+                            </span>
+                          ) : (
+                            <span className="font-bold text-amber-600 flex items-center gap-1">
+                              <Clock className="w-3.5 h-3.5" /> Menunggu Pengesahan
+                            </span>
+                          )}
+                        </div>
+                        {selectedSubmission.stage2Committee?.officialNumber && (
+                          <p className="text-[11px] font-mono font-bold text-slate-800">
+                            No. Registrasi: {selectedSubmission.stage2Committee.officialNumber}
+                          </p>
+                        )}
+                        {selectedSubmission.stage2Committee?.verifiedBy && (
+                          <p className="text-[11px] text-slate-500">
+                            Oleh: {selectedSubmission.stage2Committee.verifiedBy} ({selectedSubmission.stage2Committee.verifiedAt})
+                          </p>
+                        )}
+                        {isAdminViewer &&
+                          selectedSubmission.stage1Finance?.status === 'approved' &&
+                          selectedSubmission.stage2Committee?.status !== 'approved' && (
+                            <button
+                              type="button"
+                              onClick={() => handleOpenStage2(selectedSubmission)}
+                              className="mt-2 w-full py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold text-xs transition cursor-pointer"
+                            >
+                              Sahkan Berkas Panitia
+                            </button>
+                          )}
+                      </div>
+                    </div>
+
+                    {/* Riwayat Cicilan / Pembayaran */}
+                    {Array.isArray(selectedSubmission.installmentHistory) &&
+                      selectedSubmission.installmentHistory.length > 0 && (
+                        <div className="pt-2 border-t border-slate-200 space-y-1.5">
+                          <span className="text-[11px] font-bold text-slate-700 block">
+                            Riwayat Pembayaran ({selectedSubmission.installmentHistory.length} Transaksi):
+                          </span>
+                          <div className="space-y-1.5">
+                            {selectedSubmission.installmentHistory.map((inst, idx) => (
+                              <div
+                                key={inst.id || idx}
+                                className="flex flex-wrap items-center justify-between gap-2 bg-white p-2 rounded-lg border border-slate-200 text-[11px]"
+                              >
+                                <div>
+                                  <span className="font-mono font-bold text-slate-900">
+                                    #{idx + 1} · {formatRupiah(inst.amount)}
+                                  </span>
+                                  {inst.isDp && (
+                                    <span className="ml-1.5 px-1.5 py-0.5 bg-sky-100 text-sky-700 rounded text-[9px] font-bold">
+                                      DP Awal
+                                    </span>
+                                  )}
+                                  <span className="text-slate-500 block text-[10px]">
+                                    {inst.date} · {inst.method?.toUpperCase()}
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  {inst.proofUrl && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setZoomProofUrl(inst.proofUrl!)}
+                                      className="text-blue-600 hover:text-blue-800 underline font-semibold text-[10px] cursor-pointer"
+                                    >
+                                      Lihat Bukti
+                                    </button>
+                                  )}
+                                  <span
+                                    className={`px-2 py-0.5 rounded font-bold text-[10px] ${
+                                      inst.status === 'approved'
+                                        ? 'bg-emerald-100 text-emerald-700'
+                                        : inst.status === 'rejected'
+                                        ? 'bg-rose-100 text-rose-700'
+                                        : 'bg-amber-100 text-amber-700'
+                                    }`}
+                                  >
+                                    {inst.status === 'approved'
+                                      ? 'Disetujui'
+                                      : inst.status === 'rejected'
+                                      ? 'Ditolak'
+                                      : 'Pending'}
+                                  </span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                    {/* Bukti Bayar Preview if any */}
+                    {selectedSubmission.paymentProofUrl && (
+                      <div className="pt-2 border-t border-slate-200">
+                        <span className="text-[11px] font-bold text-slate-700 block mb-1.5">Foto Bukti Transfer Terbaru:</span>
+                        <div className="flex items-center gap-3">
+                          <img
+                            src={selectedSubmission.paymentProofUrl}
+                            alt="Bukti Transfer"
+                            onClick={() => setZoomProofUrl(selectedSubmission.paymentProofUrl!)}
+                            className="w-24 h-24 object-cover rounded-xl border border-slate-200 shadow-xs cursor-pointer hover:opacity-90"
+                          />
+                          <div className="text-xs text-slate-500">
+                            <button
+                              type="button"
+                              onClick={() => setZoomProofUrl(selectedSubmission.paymentProofUrl!)}
+                              className="text-blue-600 hover:text-blue-800 font-bold underline cursor-pointer"
+                            >
+                              Klik untuk memperbesar foto struk transfer
+                            </button>
+                            <p className="text-[11px] text-slate-400 mt-1">
+                              Metode: {selectedSubmission.paymentMethod?.toUpperCase()}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
 
               {/* Rincian Seluruh Isian Formulir */}
               <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
                 <h4 className="font-bold text-slate-800 text-xs border-b border-slate-200 pb-1">
                   Data Isian Formulir Siswa
                 </h4>
+                {Array.isArray(selectedSubmission.formData?.participants) && selectedSubmission.formData.participants.length > 0 && (
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono tabular-nums">
+                      <div className="bg-white p-2.5 rounded-lg border border-slate-200">
+                        <span className="text-[10px] font-sans font-bold text-slate-400 uppercase block">Peserta Putra</span>
+                        <span className="font-black text-blue-700">{selectedSubmission.formData.maleCount ?? 0} Orang</span>
+                      </div>
+                      <div className="bg-white p-2.5 rounded-lg border border-slate-200">
+                        <span className="text-[10px] font-sans font-bold text-slate-400 uppercase block">Peserta Putri</span>
+                        <span className="font-black text-rose-700">{selectedSubmission.formData.femaleCount ?? 0} Orang</span>
+                      </div>
+                      <div className="bg-white p-2.5 rounded-lg border border-slate-200">
+                        <span className="text-[10px] font-sans font-bold text-slate-400 uppercase block">Include Konsumsi</span>
+                        <span className="font-black text-amber-700">
+                          {selectedSubmission.formData.mealCount ?? 0} / {selectedSubmission.formData.totalParticipants ?? selectedSubmission.formData.participants.length}
+                        </span>
+                      </div>
+                      <div className="bg-emerald-50 p-2.5 rounded-lg border border-emerald-200">
+                        <span className="text-[10px] font-sans font-bold text-emerald-700 uppercase block">Rincian Total</span>
+                        <span className="font-black text-emerald-800">{formatRupiah(selectedSubmission.feeAmount || 0)}</span>
+                      </div>
+                    </div>
+
+                    <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+                      <div className="px-3 py-2 bg-emerald-50 border-b border-emerald-100 flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-[11px] font-bold text-emerald-900 uppercase">
+                          Daftar Peserta Perkemahan ({selectedSubmission.formData.participants.length} Orang)
+                        </span>
+                        {(selectedSubmission.formData.schoolFeePerForm !== undefined ||
+                          selectedSubmission.formData.baseSubtotal !== undefined ||
+                          selectedSubmission.formData.mealSubtotal !== undefined) && (
+                          <span className="text-[10px] font-mono text-emerald-800">
+                            {selectedSubmission.formType === 'kemah_balok1' &&
+                            selectedSubmission.formData.schoolFeePerForm !== undefined
+                              ? `Wajib Sekolah: ${formatRupiah(selectedSubmission.formData.schoolFeePerForm || 0)} + `
+                              : ''}
+                            Peserta: {formatRupiah(selectedSubmission.formData.baseSubtotal || 0)} + Konsumsi: {formatRupiah(selectedSubmission.formData.mealSubtotal || 0)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-[11px] border-collapse">
+                          <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
+                            <tr>
+                              <th className="py-2 px-2.5 text-center w-8">No</th>
+                              <th className="py-2 px-2.5">Nama Lengkap Peserta</th>
+                              <th className="py-2 px-2.5">Jenis Kelamin</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100">
+                            {selectedSubmission.formData.participants.map((pt: any, i: number) => (
+                              <tr key={pt?.id || i} className="hover:bg-slate-50">
+                                <td className="py-2 px-2.5 text-center text-slate-500 font-mono">{i + 1}</td>
+                                <td className="py-2 px-2.5 font-bold text-slate-900">{pt?.nama || '-'}</td>
+                                <td className="py-2 px-2.5 text-slate-700">{pt?.jk || '-'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 {Array.isArray(selectedSubmission.formData?.students) && selectedSubmission.formData.students.length > 0 && (
                   <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
                     <div className="px-3 py-2 bg-blue-50 border-b border-blue-100 flex items-center justify-between">
@@ -962,20 +1392,43 @@ export const RegistrationSubmissionsAdminView: React.FC<RegistrationSubmissionsA
             </div>
 
             <form onSubmit={handleProcessVerification} className="p-5 space-y-4 text-xs">
-              <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl flex items-center justify-between">
-                <div>
-                  <span className="text-[10px] text-slate-500 block uppercase font-bold">Total Tagihan</span>
-                  <span className="text-sm font-black font-mono text-emerald-700">
-                    {formatRupiah(selectedSubmission.feeAmount)}
-                  </span>
-                </div>
-                <div className="text-right">
-                  <span className="text-[10px] text-slate-500 block uppercase font-bold">Metode</span>
-                  <span className="font-bold capitalize text-slate-800">
-                    {selectedSubmission.paymentMethod?.replace('_', ' ')}
-                  </span>
-                </div>
-              </div>
+              {(() => {
+                const { totalFee, paid, pendingAmt } = getPaymentAmounts(selectedSubmission);
+                return (
+                  <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <span className="text-[10px] text-slate-500 block uppercase font-bold">Total Tagihan</span>
+                        <span className="text-sm font-black font-mono text-emerald-700">
+                          {formatRupiah(totalFee)}
+                        </span>
+                      </div>
+                      <div className="text-right">
+                        <span className="text-[10px] text-slate-500 block uppercase font-bold">Skema & Metode</span>
+                        <span className="font-bold capitalize text-slate-800">
+                          {selectedSubmission.paymentPlan === 'installment' ? 'Cicilan' : 'Cash'} · {selectedSubmission.paymentMethod?.replace('_', ' ')}
+                        </span>
+                      </div>
+                    </div>
+                    {verifyModalType === 'stage1' && (
+                      <div className="pt-2 border-t border-slate-200 flex items-center justify-between text-[11px]">
+                        <span className="text-slate-600">
+                          Sudah Terbayar: <strong className="font-mono text-emerald-700">{formatRupiah(paid)}</strong>
+                        </span>
+                        <span className="text-blue-700 font-bold">
+                          Diverifikasi Sekarang: <strong className="font-mono">{formatRupiah(pendingAmt)}</strong>
+                        </span>
+                      </div>
+                    )}
+                    {selectedSubmission.nomorIndukPoljar && (
+                      <div className="pt-1.5 border-t border-slate-200 text-[11px] flex items-center justify-between">
+                        <span className="text-slate-500">NIPP:</span>
+                        <span className="font-mono font-bold text-slate-800">{selectedSubmission.nomorIndukPoljar}</span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
 
               <NetworkErrorBanner
                 error={verifyNetworkError}

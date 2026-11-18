@@ -51,8 +51,10 @@ export interface ExtractedMemberItem {
   pembinaName?: string;
   contactWa?: string;
   submissionDate: string;
-  paymentStatus: 'unpaid' | 'pending_verification' | 'paid' | 'rejected';
+  paymentStatus: 'unpaid' | 'partial' | 'pending_verification' | 'paid' | 'rejected';
   verificationStatus: string;
+  nipp?: string;
+  nippStatus?: 'pending_payment' | 'active';
   fullData: Record<string, any>;
 }
 
@@ -111,7 +113,10 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
       if (sub.stage2Committee?.status === 'approved') {
         verificationStatus = 'Terverifikasi Panitia';
       } else if (sub.stage1Finance?.status === 'approved') {
-        verificationStatus = 'Lolos Keuangan';
+        verificationStatus =
+          sub.paymentStatus === 'partial' ? 'DP Valid (Cicilan Aktif)' : 'Lolos Keuangan';
+      } else if (sub.paymentStatus === 'partial') {
+        verificationStatus = 'Cicilan Aktif';
       } else if (sub.paymentStatus === 'unpaid') {
         verificationStatus = 'Belum Bayar';
       }
@@ -162,10 +167,56 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
         });
       }
 
+      // Handle multi-participant Kemah Balok 1 & Balok 2 submissions
+      if (
+        (sub.formType === 'kemah_balok1' || sub.formType === 'pks_balok2') &&
+        Array.isArray(sub.formData?.participants) &&
+        sub.formData.participants.length > 0
+      ) {
+        const isBalok1 = sub.formType === 'kemah_balok1';
+        const batchTotal = sub.formData.participants.length;
+        const mealInfo =
+          sub.formData?.mealCount !== undefined
+            ? `Konsumsi: ${sub.formData.mealCount}/${sub.formData.totalParticipants ?? batchTotal}`
+            : '';
+
+        return sub.formData.participants.map((pt: any, idx: number) => {
+          const genderText = pt?.jk || (pt?.genderGroup === 'Putri' ? 'Perempuan' : 'Laki-laki');
+          const groupLabel = pt?.genderGroup || (genderText === 'Perempuan' ? 'Putri' : 'Putra');
+          return {
+            id: `${sub.id}__${pt?.id || idx}`,
+            submissionId: sub.id,
+            categoryKey: sub.formType,
+            categoryLabel: isBalok1 ? 'Kemah PKS Balok 1' : 'Ujian PKS Balok 2',
+            studentName: (pt?.nama || '').trim() || `Peserta #${idx + 1}`,
+            schoolName: sub.schoolName,
+            schoolLevel: sub.schoolLevel || 'SLTP',
+            identifier: [groupLabel, mealInfo].filter(Boolean).join(' · ') || `Peserta #${idx + 1}`,
+            classGrade: mealInfo || '-',
+            gender: genderText,
+            pembinaName,
+            contactWa: sub.contactWa || sub.formData?.noHpPembina || '-',
+            submissionDate,
+            paymentStatus: sub.paymentStatus,
+            verificationStatus,
+            fullData: {
+              ...sub.formData,
+              nama: pt?.nama || '',
+              jk: genderText,
+              genderGroup: groupLabel,
+              batchIndex: idx + 1,
+              batchTotal
+            }
+          };
+        });
+      }
+
       if (sub.formType === 'polisi_pelajar') {
         categoryLabel = 'Polisi Pelajar (Poljar)';
         studentName = sub.formData?.nama || sub.applicantName;
-        identifier = sub.formData?.nisn ? `NISN: ${sub.formData.nisn}` : 'NISN: -';
+        const nisnLabel = sub.formData?.nisn ? `NISN: ${sub.formData.nisn}` : 'NISN: -';
+        identifier = sub.nomorIndukPoljar ? sub.nomorIndukPoljar : nisnLabel;
+        classGrade = sub.formData?.kelas || nisnLabel;
       } else if (sub.formType === 'calon_pks') {
         categoryLabel = 'Calon Anggota PKS';
         studentName = sub.formData?.nama || sub.applicantName;
@@ -204,7 +255,15 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
           submissionDate,
           paymentStatus: sub.paymentStatus,
           verificationStatus,
-          fullData: sub.formData || {}
+          nipp: sub.nomorIndukPoljar,
+          nippStatus: sub.nippStatus,
+          fullData: {
+            ...(sub.formData || {}),
+            nomorIndukPoljar: sub.nomorIndukPoljar,
+            nippStatus: sub.nippStatus,
+            tahunAngkatan: sub.tahunAngkatan,
+            angkatan: sub.angkatan
+          }
         }
       ];
     });
@@ -252,9 +311,11 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
         const matchName = item.studentName.toLowerCase().includes(q);
         const matchSchool = item.schoolName.toLowerCase().includes(q);
         const matchId = item.identifier.toLowerCase().includes(q);
+        const matchNipp = (item.nipp || '').toLowerCase().includes(q);
+        const matchNisn = String(item.fullData?.nisn || '').toLowerCase().includes(q);
         const matchPembina = (item.pembinaName || '').toLowerCase().includes(q);
         const matchWa = (item.contactWa || '').includes(q);
-        if (!matchName && !matchSchool && !matchId && !matchPembina && !matchWa) {
+        if (!matchName && !matchSchool && !matchId && !matchNipp && !matchNisn && !matchPembina && !matchWa) {
           return false;
         }
       }
@@ -278,14 +339,25 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
       'Kategori PKS': m.categoryLabel,
       'Asal Pangkalan / Sekolah': m.schoolName,
       'Jenjang': m.schoolLevel,
+      'Nomor Induk (NIPP)': m.nipp || '-',
+      'Status NIPP': m.nipp ? (m.nippStatus === 'active' ? 'Aktif' : 'Menunggu Bayar') : '-',
       'Identitas / NISN / Regu': m.identifier,
-      'Kelas': m.classGrade || '-',
+      'Kelas / Keterangan': m.classGrade || '-',
       'Jenis Kelamin': m.gender || '-',
       'Pembina Pendamping': m.pembinaName || '-',
       'Kontak WA': m.contactWa || '-',
       'Tanggal Terdaftar': m.submissionDate,
       'Status Verifikasi': m.verificationStatus,
-      'Status Pembayaran': m.paymentStatus === 'paid' ? 'Lunas' : m.paymentStatus === 'unpaid' ? 'Belum Lunas' : 'Menunggu Konfirmasi'
+      'Status Pembayaran':
+        m.paymentStatus === 'paid'
+          ? 'Lunas'
+          : m.paymentStatus === 'partial'
+          ? 'Cicilan Aktif'
+          : m.paymentStatus === 'unpaid'
+          ? 'Belum Lunas'
+          : m.paymentStatus === 'rejected'
+          ? 'Ditolak'
+          : 'Menunggu Konfirmasi'
     }));
 
     const worksheet = XLSX.utils.json_to_sheet(rows);
@@ -675,7 +747,11 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
                           {member.classGrade && member.classGrade !== '-' && (
                             <>
                               <span aria-hidden="true">·</span>
-                              <span>Kelas: {member.classGrade}</span>
+                              <span>
+                                {member.classGrade.startsWith('NISN:')
+                                  ? member.classGrade
+                                  : `Kelas: ${member.classGrade}`}
+                              </span>
                             </>
                           )}
                         </div>
@@ -707,9 +783,20 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
 
                       {/* Identifier */}
                       <td className="py-3 px-3 font-mono text-slate-700">
-                        <span className="bg-slate-100 border border-slate-200 px-2 py-0.5 rounded text-[11px] font-semibold block truncate max-w-[180px]">
+                        <span className="bg-slate-100 border border-slate-200 px-2 py-0.5 rounded text-[11px] font-semibold block truncate max-w-[190px]">
                           {member.identifier}
                         </span>
+                        {member.nipp && (
+                          <span
+                            className={`inline-block mt-0.5 px-1.5 py-0.5 rounded text-[9px] font-bold font-sans ${
+                              member.nippStatus === 'active'
+                                ? 'bg-emerald-100 text-emerald-700'
+                                : 'bg-amber-100 text-amber-700'
+                            }`}
+                          >
+                            {member.nippStatus === 'active' ? 'NIPP Aktif' : 'NIPP Menunggu Bayar'}
+                          </span>
+                        )}
                       </td>
 
                       {/* Pembina & WA */}
@@ -730,12 +817,14 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
                         <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
                           member.paymentStatus === 'paid'
                             ? 'bg-emerald-100 text-emerald-800'
+                            : member.paymentStatus === 'partial'
+                            ? 'bg-sky-100 text-sky-800'
                             : member.paymentStatus === 'pending_verification'
                             ? 'bg-amber-100 text-amber-800'
                             : 'bg-rose-100 text-rose-800'
                         }`}>
-                          {member.paymentStatus === 'paid' ? (
-                            <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                          {member.paymentStatus === 'paid' || member.paymentStatus === 'partial' ? (
+                            <CheckCircle2 className={`w-3 h-3 ${member.paymentStatus === 'paid' ? 'text-emerald-600' : 'text-sky-600'}`} />
                           ) : (
                             <Clock className="w-3 h-3 text-amber-600" />
                           )}
@@ -818,6 +907,8 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
                   <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-black ${
                     detailModalItem.paymentStatus === 'paid'
                       ? 'bg-emerald-100 text-emerald-800'
+                      : detailModalItem.paymentStatus === 'partial'
+                      ? 'bg-sky-100 text-sky-800'
                       : 'bg-amber-100 text-amber-800'
                   }`}>
                     {detailModalItem.verificationStatus}
@@ -828,13 +919,34 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
               {/* Data Properties Grid */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-slate-50 p-4 rounded-2xl border border-slate-200">
                 <div>
-                  <span className="text-[10px] font-bold text-slate-400 uppercase">Identitas / No. Registrasi</span>
-                  <p className="font-bold text-slate-900 mt-0.5">{detailModalItem.identifier}</p>
+                  <span className="text-[10px] font-bold text-slate-400 uppercase">
+                    {detailModalItem.nipp ? 'Nomor Induk Polisi Pelajar (NIPP)' : 'Identitas / No. Registrasi'}
+                  </span>
+                  <p className="font-bold font-mono text-slate-900 mt-0.5">{detailModalItem.identifier}</p>
+                  {detailModalItem.nipp && (
+                    <span
+                      className={`inline-block mt-1 px-2 py-0.5 rounded text-[10px] font-bold ${
+                        detailModalItem.nippStatus === 'active'
+                          ? 'bg-emerald-100 text-emerald-700'
+                          : 'bg-amber-100 text-amber-700'
+                      }`}
+                    >
+                      {detailModalItem.nippStatus === 'active'
+                        ? 'NIPP Aktif'
+                        : 'Menunggu Verifikasi Pembayaran'}
+                    </span>
+                  )}
                 </div>
 
                 <div>
-                  <span className="text-[10px] font-bold text-slate-400 uppercase">Kelas / Tingkat</span>
-                  <p className="font-bold text-slate-900 mt-0.5">{detailModalItem.classGrade || '-'}</p>
+                  <span className="text-[10px] font-bold text-slate-400 uppercase">
+                    {detailModalItem.categoryKey === 'polisi_pelajar' ? 'NISN' : 'Kelas / Tingkat'}
+                  </span>
+                  <p className="font-bold text-slate-900 mt-0.5">
+                    {detailModalItem.categoryKey === 'polisi_pelajar'
+                      ? detailModalItem.fullData?.nisn || '-'
+                      : detailModalItem.classGrade || '-'}
+                  </p>
                 </div>
 
                 <div>
@@ -847,15 +959,19 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
                   <p className="font-bold text-slate-900 mt-0.5">{detailModalItem.submissionDate}</p>
                 </div>
 
-                <div>
-                  <span className="text-[10px] font-bold text-slate-400 uppercase">Guru Pembina</span>
-                  <p className="font-bold text-slate-900 mt-0.5">{detailModalItem.pembinaName || '-'}</p>
-                </div>
+                {detailModalItem.categoryKey !== 'polisi_pelajar' && (
+                  <>
+                    <div>
+                      <span className="text-[10px] font-bold text-slate-400 uppercase">Guru Pembina</span>
+                      <p className="font-bold text-slate-900 mt-0.5">{detailModalItem.pembinaName || '-'}</p>
+                    </div>
 
-                <div>
-                  <span className="text-[10px] font-bold text-slate-400 uppercase">Kontak WhatsApp</span>
-                  <p className="font-bold text-slate-900 mt-0.5 font-mono">{detailModalItem.contactWa || '-'}</p>
-                </div>
+                    <div>
+                      <span className="text-[10px] font-bold text-slate-400 uppercase">Kontak WhatsApp</span>
+                      <p className="font-bold text-slate-900 mt-0.5 font-mono">{detailModalItem.contactWa || '-'}</p>
+                    </div>
+                  </>
+                )}
               </div>
 
               {/* Additional Form Fields */}
@@ -873,16 +989,50 @@ export const MembersDirectoryView: React.FC<MembersDirectoryViewProps> = ({
                         </span>
                       </div>
                     )}
-                    {detailModalItem.fullData.ttl && (
+                    {detailModalItem.fullData.tahunAngkatan && (
                       <div className="flex justify-between py-1 border-b border-slate-100">
-                        <span className="text-slate-400">Tempat, Tanggal Lahir:</span>
-                        <span className="font-semibold text-slate-800">{detailModalItem.fullData.ttl}</span>
+                        <span className="text-slate-400">Tahun / Angkatan:</span>
+                        <span className="font-semibold text-slate-800">
+                          Tahun {detailModalItem.fullData.tahunAngkatan} · Angkatan {detailModalItem.fullData.angkatan || '-'}
+                        </span>
+                      </div>
+                    )}
+                    {(detailModalItem.fullData.ttl || detailModalItem.fullData.tanggalLahir) && (
+                      <div className="flex justify-between py-1 border-b border-slate-100">
+                        <span className="text-slate-400">
+                          {detailModalItem.fullData.ttl ? 'Tempat, Tanggal Lahir:' : 'Tanggal Lahir:'}
+                        </span>
+                        <span className="font-semibold text-slate-800">
+                          {detailModalItem.fullData.ttl || formatBirthDate(detailModalItem.fullData.tanggalLahir)}
+                        </span>
+                      </div>
+                    )}
+                    {(detailModalItem.fullData.tinggiBadan || detailModalItem.fullData.beratBadan) && (
+                      <div className="flex justify-between py-1 border-b border-slate-100">
+                        <span className="text-slate-400">Tinggi / Berat Badan:</span>
+                        <span className="font-semibold text-slate-800">
+                          {detailModalItem.fullData.tinggiBadan ? `${detailModalItem.fullData.tinggiBadan} cm` : '-'} / {detailModalItem.fullData.beratBadan ? `${detailModalItem.fullData.beratBadan} kg` : '-'}
+                        </span>
+                      </div>
+                    )}
+                    {detailModalItem.fullData.golDarah && (
+                      <div className="flex justify-between py-1 border-b border-slate-100">
+                        <span className="text-slate-400">Golongan Darah:</span>
+                        <span className="font-semibold text-slate-800">{detailModalItem.fullData.golDarah}</span>
+                      </div>
+                    )}
+                    {(detailModalItem.fullData.alergi || detailModalItem.fullData.riwayatPenyakit) && (
+                      <div className="flex justify-between py-1 border-b border-slate-100">
+                        <span className="text-slate-400">Alergi:</span>
+                        <span className="font-semibold text-slate-800">
+                          {detailModalItem.fullData.alergi || detailModalItem.fullData.riwayatPenyakit}
+                        </span>
                       </div>
                     )}
                     {detailModalItem.fullData.alamat && (
-                      <div className="flex justify-between py-1 border-b border-slate-100">
-                        <span className="text-slate-400">Alamat Rumah:</span>
-                        <span className="font-semibold text-slate-800">{detailModalItem.fullData.alamat}</span>
+                      <div className="flex justify-between gap-4 py-1 border-b border-slate-100">
+                        <span className="text-slate-400 shrink-0">Alamat Rumah:</span>
+                        <span className="font-semibold text-slate-800 text-right">{detailModalItem.fullData.alamat}</span>
                       </div>
                     )}
                     {detailModalItem.fullData.namaOrtu && (

@@ -27,6 +27,8 @@ export interface AutoBackupPayload {
   registrationsList?: any[];
   paymentConfig?: any;
   blankoConfig?: any;
+  cerdasCermatConfig?: any;
+  cerdasCermatSubmissions?: any[];
   appStatus?: any;
 }
 

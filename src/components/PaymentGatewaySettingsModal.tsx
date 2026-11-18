@@ -18,7 +18,12 @@ import {
   EyeOff,
   Sparkles
 } from 'lucide-react';
-import { PaymentConfig, DEFAULT_PAYMENT_CONFIG } from '../lib/firebase';
+import {
+  PaymentConfig,
+  DEFAULT_PAYMENT_CONFIG,
+  generateNomorIndukPoljar,
+  normalizeAngkatanCode
+} from '../lib/firebase';
 import { compressImageFile } from '../lib/imageUtils';
 import { NetworkErrorBanner, NetworkErrorState } from './NetworkErrorBanner';
 
@@ -45,9 +50,38 @@ export const PaymentGatewaySettingsModal: React.FC<PaymentGatewaySettingsModalPr
   const [showServerKey, setShowServerKey] = useState(false);
   const [showRatapayKey, setShowRatapayKey] = useState(false);
 
+  const poljarSettings = {
+    ...DEFAULT_PAYMENT_CONFIG.poljarSettings!,
+    ...(config.poljarSettings || {})
+  };
+
   useEffect(() => {
     if (isOpen) {
-      setConfig(paymentConfig);
+      setConfig({
+        ...paymentConfig,
+        poljarSettings: {
+          ...DEFAULT_PAYMENT_CONFIG.poljarSettings!,
+          ...(paymentConfig.poljarSettings || {})
+        },
+        formFees: {
+          polisi_pelajar: {
+            ...DEFAULT_PAYMENT_CONFIG.formFees.polisi_pelajar,
+            ...(paymentConfig.formFees?.polisi_pelajar || {})
+          },
+          calon_pks: {
+            ...DEFAULT_PAYMENT_CONFIG.formFees.calon_pks,
+            ...(paymentConfig.formFees?.calon_pks || {})
+          },
+          kemah_balok1: {
+            ...DEFAULT_PAYMENT_CONFIG.formFees.kemah_balok1,
+            ...(paymentConfig.formFees?.kemah_balok1 || {})
+          },
+          pks_balok2: {
+            ...DEFAULT_PAYMENT_CONFIG.formFees.pks_balok2,
+            ...(paymentConfig.formFees?.pks_balok2 || {})
+          }
+        }
+      });
       setNetworkError(null);
       setConfirmReset(false);
     }
@@ -55,9 +89,23 @@ export const PaymentGatewaySettingsModal: React.FC<PaymentGatewaySettingsModalPr
 
   if (!isOpen) return null;
 
+  const handlePoljarSettingChange = (
+    field: 'tahunAngkatan' | 'angkatan' | 'allowInstallment' | 'minDpPercent',
+    value: any
+  ) => {
+    setConfig(prev => ({
+      ...prev,
+      poljarSettings: {
+        ...DEFAULT_PAYMENT_CONFIG.poljarSettings!,
+        ...(prev.poljarSettings || {}),
+        [field]: value
+      }
+    }));
+  };
+
   const handleFeeChange = (
     formKey: keyof PaymentConfig['formFees'],
-    field: 'fee' | 'isFree' | 'description',
+    field: 'fee' | 'mealFee' | 'schoolFee' | 'isFree' | 'description',
     value: any
   ) => {
     setConfig(prev => ({
@@ -338,6 +386,105 @@ export const PaymentGatewaySettingsModal: React.FC<PaymentGatewaySettingsModalPr
                     </div>
                   </div>
                 )}
+
+                {/* Pengaturan Angkatan, NIPP, & Cicilan DP Minimal */}
+                <div className="mt-2 pt-3 border-t border-slate-200 space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div>
+                      <span className="text-[11px] font-bold text-blue-900 uppercase tracking-wider block">
+                        Pengaturan Angkatan, NIPP & Cicilan (Diatur Admin)
+                      </span>
+                      <span className="text-[10px] text-slate-500">
+                        Tahun Angkatan & Angkatan dipakai otomatis untuk Nomor Induk Polisi Pelajar (PP-Tahun-Angkatan-TglLahir)
+                      </span>
+                    </div>
+                    <div className="px-2.5 py-1 bg-white border border-blue-200 rounded-lg text-[11px] font-mono font-bold text-blue-900 shrink-0">
+                      Contoh NIPP: {generateNomorIndukPoljar(poljarSettings.tahunAngkatan, poljarSettings.angkatan, '2012-01-15')}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-700 uppercase mb-1">
+                        Tahun Angkatan
+                      </label>
+                      <input
+                        type="text"
+                        maxLength={4}
+                        value={poljarSettings.tahunAngkatan}
+                        onChange={e =>
+                          handlePoljarSettingChange('tahunAngkatan', e.target.value.replace(/[^\d]/g, '').slice(0, 4))
+                        }
+                        placeholder="2026"
+                        className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono font-bold text-slate-900 bg-white focus:ring-2 focus:ring-blue-500 outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-700 uppercase mb-1">
+                        Angkatan
+                      </label>
+                      <input
+                        type="text"
+                        maxLength={4}
+                        value={poljarSettings.angkatan}
+                        onChange={e =>
+                          handlePoljarSettingChange('angkatan', e.target.value.slice(0, 4))
+                        }
+                        placeholder="01"
+                        className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono font-bold text-slate-900 bg-white focus:ring-2 focus:ring-blue-500 outline-none"
+                      />
+                      <span className="text-[10px] text-slate-500 font-mono mt-0.5 block">
+                        Kode: {normalizeAngkatanCode(poljarSettings.angkatan)}
+                      </span>
+                    </div>
+
+                    {!config.formFees.polisi_pelajar.isFree && (
+                      <>
+                        <div className="flex flex-col justify-center">
+                          <label className="block text-[11px] font-bold text-slate-700 uppercase mb-1">
+                            Skema Cicilan
+                          </label>
+                          <label className="flex items-center gap-2 text-xs font-bold text-slate-700 bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={poljarSettings.allowInstallment}
+                              onChange={e =>
+                                handlePoljarSettingChange('allowInstallment', e.target.checked)
+                              }
+                              className="rounded text-blue-600 focus:ring-blue-500"
+                            />
+                            <span>Izinkan Cicilan</span>
+                          </label>
+                        </div>
+
+                        <div>
+                          <label className="block text-[11px] font-bold text-slate-700 uppercase mb-1">
+                            DP Minimal (%)
+                          </label>
+                          <input
+                            type="number"
+                            min="10"
+                            max="90"
+                            disabled={!poljarSettings.allowInstallment}
+                            value={poljarSettings.minDpPercent}
+                            onChange={e => {
+                              const raw = Number(e.target.value) || 10;
+                              const clamped = Math.max(10, Math.min(90, raw));
+                              handlePoljarSettingChange('minDpPercent', clamped);
+                            }}
+                            className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono font-bold text-slate-900 bg-white disabled:bg-slate-100 disabled:text-slate-400 focus:ring-2 focus:ring-blue-500 outline-none"
+                          />
+                          {poljarSettings.allowInstallment && (
+                            <span className="text-[10px] text-emerald-700 font-mono font-semibold mt-0.5 block">
+                              Min DP: {formatRupiah(Math.ceil((config.formFees.polisi_pelajar.fee * poljarSettings.minDpPercent) / 100))}
+                            </span>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
               </div>
 
               {/* Form 2: Calon Anggota PKS */}
@@ -406,11 +553,16 @@ export const PaymentGatewaySettingsModal: React.FC<PaymentGatewaySettingsModalPr
               <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-200 pb-2">
                   <div>
-                    <h3 className="font-bold text-sm text-slate-900">
-                      3. Formulir Pendaftaran Perkemahan PKS (Tingkat Balok 1)
-                    </h3>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="font-bold text-sm text-slate-900">
+                        3. Formulir Pendaftaran Perkemahan PKS (Tingkat Balok 1)
+                      </h3>
+                      <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-200 text-[10px] font-black uppercase">
+                        Wajib Cash 100%
+                      </span>
+                    </div>
                     <p className="text-[11px] text-slate-500">
-                      Perkemahan pelantikan dan pengukuhan tingkatan Balok 1
+                      Biaya wajib tiap sekolah (per formulir dikirim) + tarif dasar peserta + tarif konsumsi · Tanpa cicilan/DP
                     </p>
                   </div>
                   <label className="flex items-center gap-2 text-xs font-bold text-slate-700 cursor-pointer select-none">
@@ -427,26 +579,67 @@ export const PaymentGatewaySettingsModal: React.FC<PaymentGatewaySettingsModalPr
                 </div>
 
                 {!config.formFees.kemah_balok1.isFree && (
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                    <div>
-                      <label className="block text-[11px] font-bold text-slate-700 uppercase mb-1">
-                        Nominal Biaya (Rp)
-                      </label>
-                      <input
-                        type="number"
-                        min="0"
-                        step="1000"
-                        value={config.formFees.kemah_balok1.fee}
-                        onChange={e =>
-                          handleFeeChange('kemah_balok1', 'fee', Number(e.target.value) || 0)
-                        }
-                        className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono font-bold text-slate-900 focus:ring-2 focus:ring-blue-500 outline-none"
-                      />
-                      <span className="text-[10px] text-slate-500 font-mono mt-0.5 block">
-                        {formatRupiah(config.formFees.kemah_balok1.fee)}
-                      </span>
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      <div>
+                        <label className="block text-[11px] font-bold text-amber-900 uppercase mb-1">
+                          Biaya Wajib / Sekolah (Rp)
+                        </label>
+                        <input
+                          type="number"
+                          min="0"
+                          step="1000"
+                          value={config.formFees.kemah_balok1.schoolFee ?? DEFAULT_PAYMENT_CONFIG.formFees.kemah_balok1.schoolFee ?? 0}
+                          onChange={e =>
+                            handleFeeChange('kemah_balok1', 'schoolFee', Number(e.target.value) || 0)
+                          }
+                          className="w-full px-3 py-1.5 border border-amber-300 bg-white rounded-lg text-xs font-mono font-bold text-amber-950 focus:ring-2 focus:ring-amber-500 outline-none tabular-nums"
+                        />
+                        <span className="text-[10px] text-amber-800 font-mono mt-0.5 block">
+                          {formatRupiah(config.formFees.kemah_balok1.schoolFee ?? DEFAULT_PAYMENT_CONFIG.formFees.kemah_balok1.schoolFee ?? 0)} / formulir sekolah
+                        </span>
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] font-bold text-slate-700 uppercase mb-1">
+                          Tarif Dasar / Peserta (Rp)
+                        </label>
+                        <input
+                          type="number"
+                          min="0"
+                          step="1000"
+                          value={config.formFees.kemah_balok1.fee}
+                          onChange={e =>
+                            handleFeeChange('kemah_balok1', 'fee', Number(e.target.value) || 0)
+                          }
+                          className="w-full px-3 py-1.5 border border-slate-300 bg-white rounded-lg text-xs font-mono font-bold text-slate-900 focus:ring-2 focus:ring-blue-500 outline-none tabular-nums"
+                        />
+                        <span className="text-[10px] text-slate-500 font-mono mt-0.5 block">
+                          {formatRupiah(config.formFees.kemah_balok1.fee)} / peserta
+                        </span>
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] font-bold text-emerald-800 uppercase mb-1">
+                          Tarif Konsumsi / Peserta (Rp)
+                        </label>
+                        <input
+                          type="number"
+                          min="0"
+                          step="1000"
+                          value={config.formFees.kemah_balok1.mealFee ?? DEFAULT_PAYMENT_CONFIG.formFees.kemah_balok1.mealFee ?? 0}
+                          onChange={e =>
+                            handleFeeChange('kemah_balok1', 'mealFee', Number(e.target.value) || 0)
+                          }
+                          className="w-full px-3 py-1.5 border border-emerald-300 bg-white rounded-lg text-xs font-mono font-bold text-emerald-900 focus:ring-2 focus:ring-emerald-500 outline-none tabular-nums"
+                        />
+                        <span className="text-[10px] text-emerald-700 font-mono mt-0.5 block">
+                          {formatRupiah(config.formFees.kemah_balok1.mealFee ?? DEFAULT_PAYMENT_CONFIG.formFees.kemah_balok1.mealFee ?? 0)} / konsumsi
+                        </span>
+                      </div>
                     </div>
-                    <div className="sm:col-span-2">
+
+                    <div>
                       <label className="block text-[11px] font-bold text-slate-700 uppercase mb-1">
                         Keterangan Rincian Biaya
                       </label>
@@ -456,9 +649,22 @@ export const PaymentGatewaySettingsModal: React.FC<PaymentGatewaySettingsModalPr
                         onChange={e =>
                           handleFeeChange('kemah_balok1', 'description', e.target.value)
                         }
-                        placeholder="Contoh: Konsumsi perkemahan 3 hari 2 malam, kavling tenda, scarf..."
-                        className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs text-slate-800 focus:ring-2 focus:ring-blue-500 outline-none"
+                        placeholder="Contoh: Biaya wajib sekolah per pengajuan + biaya dasar peserta & opsi konsumsi..."
+                        className="w-full px-3 py-1.5 border border-slate-300 bg-white rounded-lg text-xs text-slate-800 focus:ring-2 focus:ring-blue-500 outline-none"
                       />
+                    </div>
+
+                    <div className="px-3 py-2 bg-white border border-slate-200 rounded-lg text-[11px] text-slate-600 flex flex-wrap items-center justify-between gap-2">
+                      <span>
+                        Rumus (Cash Penuh): <strong className="text-slate-800">Biaya Wajib Sekolah + (Total Peserta × Tarif Dasar) + (Konsumsi × Tarif Konsumsi)</strong>
+                      </span>
+                      <span className="font-mono font-bold text-slate-900 tabular-nums">
+                        Simulasi 1 Sekolah + 10 Peserta + 8 Konsumsi = {formatRupiah(
+                          (config.formFees.kemah_balok1.schoolFee ?? DEFAULT_PAYMENT_CONFIG.formFees.kemah_balok1.schoolFee ?? 0) +
+                          10 * (config.formFees.kemah_balok1.fee || 0) +
+                          8 * (config.formFees.kemah_balok1.mealFee ?? DEFAULT_PAYMENT_CONFIG.formFees.kemah_balok1.mealFee ?? 0)
+                        )}
+                      </span>
                     </div>
                   </div>
                 )}
@@ -469,10 +675,10 @@ export const PaymentGatewaySettingsModal: React.FC<PaymentGatewaySettingsModalPr
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-200 pb-2">
                   <div>
                     <h3 className="font-bold text-sm text-slate-900">
-                      4. Formulir Ujian Kepangkatan PKS (Tingkat Balok 2)
+                      4. Formulir Perkemahan & Ujian PKS (Tingkat Balok 2)
                     </h3>
                     <p className="text-[11px] text-slate-500">
-                      Ujian kenaikan tingkat, evaluasi kecakapan, & rekomendasi Satlantas
+                      Tarif dasar per peserta ditambah tarif konsumsi bagi peserta yang ikut konsumsi
                     </p>
                   </div>
                   <label className="flex items-center gap-2 text-xs font-bold text-slate-700 cursor-pointer select-none">
@@ -489,38 +695,72 @@ export const PaymentGatewaySettingsModal: React.FC<PaymentGatewaySettingsModalPr
                 </div>
 
                 {!config.formFees.pks_balok2.isFree && (
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                    <div>
-                      <label className="block text-[11px] font-bold text-slate-700 uppercase mb-1">
-                        Nominal Biaya (Rp)
-                      </label>
-                      <input
-                        type="number"
-                        min="0"
-                        step="1000"
-                        value={config.formFees.pks_balok2.fee}
-                        onChange={e =>
-                          handleFeeChange('pks_balok2', 'fee', Number(e.target.value) || 0)
-                        }
-                        className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono font-bold text-slate-900 focus:ring-2 focus:ring-blue-500 outline-none"
-                      />
-                      <span className="text-[10px] text-slate-500 font-mono mt-0.5 block">
-                        {formatRupiah(config.formFees.pks_balok2.fee)}
-                      </span>
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                      <div>
+                        <label className="block text-[11px] font-bold text-slate-700 uppercase mb-1">
+                          Tarif Dasar / Peserta (Rp)
+                        </label>
+                        <input
+                          type="number"
+                          min="0"
+                          step="1000"
+                          value={config.formFees.pks_balok2.fee}
+                          onChange={e =>
+                            handleFeeChange('pks_balok2', 'fee', Number(e.target.value) || 0)
+                          }
+                          className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono font-bold text-slate-900 focus:ring-2 focus:ring-blue-500 outline-none tabular-nums"
+                        />
+                        <span className="text-[10px] text-slate-500 font-mono mt-0.5 block">
+                          {formatRupiah(config.formFees.pks_balok2.fee)} / peserta
+                        </span>
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] font-bold text-purple-800 uppercase mb-1">
+                          Tarif Konsumsi / Peserta (Rp)
+                        </label>
+                        <input
+                          type="number"
+                          min="0"
+                          step="1000"
+                          value={config.formFees.pks_balok2.mealFee ?? DEFAULT_PAYMENT_CONFIG.formFees.pks_balok2.mealFee ?? 0}
+                          onChange={e =>
+                            handleFeeChange('pks_balok2', 'mealFee', Number(e.target.value) || 0)
+                          }
+                          className="w-full px-3 py-1.5 border border-purple-300 bg-white rounded-lg text-xs font-mono font-bold text-purple-900 focus:ring-2 focus:ring-purple-500 outline-none tabular-nums"
+                        />
+                        <span className="text-[10px] text-purple-700 font-mono mt-0.5 block">
+                          {formatRupiah(config.formFees.pks_balok2.mealFee ?? DEFAULT_PAYMENT_CONFIG.formFees.pks_balok2.mealFee ?? 0)} / konsumsi
+                        </span>
+                      </div>
+
+                      <div className="sm:col-span-2">
+                        <label className="block text-[11px] font-bold text-slate-700 uppercase mb-1">
+                          Keterangan Rincian Biaya
+                        </label>
+                        <input
+                          type="text"
+                          value={config.formFees.pks_balok2.description}
+                          onChange={e =>
+                            handleFeeChange('pks_balok2', 'description', e.target.value)
+                          }
+                          placeholder="Contoh: Biaya dasar peserta Balok 2 & opsi konsumsi..."
+                          className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs text-slate-800 focus:ring-2 focus:ring-blue-500 outline-none"
+                        />
+                      </div>
                     </div>
-                    <div className="sm:col-span-2">
-                      <label className="block text-[11px] font-bold text-slate-700 uppercase mb-1">
-                        Keterangan Rincian Biaya
-                      </label>
-                      <input
-                        type="text"
-                        value={config.formFees.pks_balok2.description}
-                        onChange={e =>
-                          handleFeeChange('pks_balok2', 'description', e.target.value)
-                        }
-                        placeholder="Contoh: Penguji Satlantas, sertifikat kelulusan Balok 2..."
-                        className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs text-slate-800 focus:ring-2 focus:ring-blue-500 outline-none"
-                      />
+
+                    <div className="px-3 py-2 bg-white border border-slate-200 rounded-lg text-[11px] text-slate-600 flex flex-wrap items-center justify-between gap-2">
+                      <span>
+                        Rumus otomatis: <strong className="text-slate-800">(Total Peserta × Tarif Dasar) + (Peserta Konsumsi × Tarif Konsumsi)</strong>
+                      </span>
+                      <span className="font-mono font-bold text-slate-900 tabular-nums">
+                        Simulasi 10 Peserta + 8 Konsumsi = {formatRupiah(
+                          10 * (config.formFees.pks_balok2.fee || 0) +
+                          8 * (config.formFees.pks_balok2.mealFee ?? DEFAULT_PAYMENT_CONFIG.formFees.pks_balok2.mealFee ?? 0)
+                        )}
+                      </span>
                     </div>
                   </div>
                 )}

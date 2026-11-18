@@ -2,6 +2,13 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
+import {
+  applyDeltaMutationsToServer,
+  getServerBackupState,
+  getServerBackupStatus,
+  getServerSnapshots,
+  saveSnapshotToServer,
+} from './serverBackupStore.ts';
 
 dotenv.config();
 
@@ -100,11 +107,116 @@ Analisis lembar form penilaian di foto ini:
   }
 });
 
-// Vite middleware in development
+// Server-side Cloud Backup & Delta Sync API endpoints
+app.get('/api/cloud-backup/status', async (_req, res) => {
+  try {
+    const status = await getServerBackupStatus();
+    return res.json(status);
+  } catch (error: any) {
+    return res.status(500).json({
+      available: false,
+      error: error?.message || 'Gagal membaca status cadangan server.',
+    });
+  }
+});
+
+app.get('/api/cloud-backup/state', async (_req, res) => {
+  try {
+    const state = await getServerBackupState();
+    return res.json(state);
+  } catch (error: any) {
+    return res.status(500).json({
+      available: false,
+      error: error?.message || 'Gagal membaca data cadangan server.',
+    });
+  }
+});
+
+app.get('/api/cloud-backup/snapshots', async (_req, res) => {
+  try {
+    const snapshots = await getServerSnapshots();
+    return res.json({ success: true, snapshots });
+  } catch (error: any) {
+    return res.status(500).json({
+      success: false,
+      error: error?.message || 'Gagal membaca daftar snapshot server.',
+    });
+  }
+});
+
+app.post('/api/cloud-backup/delta', async (req, res) => {
+  try {
+    const mutations = Array.isArray(req.body?.mutations) ? req.body.mutations : [];
+    const result = await applyDeltaMutationsToServer(mutations);
+    return res.json(result);
+  } catch (error: any) {
+    console.error('Error applying server backup delta:', error);
+    return res.status(500).json({
+      success: false,
+      error: error?.message || 'Gagal menyimpan perubahan delta ke cadangan server.',
+    });
+  }
+});
+
+app.post('/api/cloud-backup/snapshot', async (req, res) => {
+  try {
+    const snapshot = req.body?.snapshot;
+    if (!snapshot || !snapshot.id || !snapshot.payload) {
+      return res.status(400).json({
+        success: false,
+        error: 'Payload snapshot cadangan server tidak lengkap.',
+      });
+    }
+    const result = await saveSnapshotToServer(snapshot);
+    return res.json(result);
+  } catch (error: any) {
+    console.error('Error saving snapshot to server backup:', error);
+    return res.status(500).json({
+      success: false,
+      error: error?.message || 'Gagal menyimpan snapshot ke cadangan server.',
+    });
+  }
+});
+
+// Vite middleware in development (HMR disabled in AI Studio container)
 const vite = await createViteServer({
-  server: { middlewareMode: true },
+  server: {
+    middlewareMode: true,
+    hmr: false,
+    ws: false,
+  },
   appType: 'spa',
 });
+
+// Prevent Vite 8 @vite/client from opening a failing WebSocket when HMR/WS is disabled,
+// while preserving updateStyle/removeStyle/createHotContext exports.
+app.get('/@vite/client', async (req, res, next) => {
+  try {
+    const result = await vite.transformRequest(req.originalUrl || '/@vite/client');
+    if (!result?.code) return next();
+    const patchedCode = result.code
+      .replace(
+        'transport.connect(createHMRHandler(handleMessage));',
+        '/* HMR WebSocket disabled */'
+      )
+      .replace(
+        'ws.send(JSON.stringify(data));',
+        'ws?.send?.(JSON.stringify(data));'
+      )
+      .replace(
+        'else throw new SendBeforeConnectError("send was called before connect");',
+        'else return;'
+      )
+      .replace(
+        'else throw new SendBeforeConnectError("invoke was called before connect");',
+        'else return null;'
+      );
+    res.status(200).type('application/javascript').send(patchedCode);
+  } catch {
+    next();
+  }
+});
+
 app.use(vite.middlewares);
 
 app.listen(port, '0.0.0.0', () => {

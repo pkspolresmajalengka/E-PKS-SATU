@@ -323,6 +323,8 @@ interface OfflineConnectivityBarProps {
   isOnline: boolean;
   pendingCount: number;
   isSyncing: boolean;
+  cloudQuotaExceeded?: boolean;
+  serverBackupAvailable?: boolean;
   onSyncNow: () => void;
 }
 
@@ -330,6 +332,8 @@ export const OfflineConnectivityBar: React.FC<OfflineConnectivityBarProps> = ({
   isOnline,
   pendingCount,
   isSyncing,
+  cloudQuotaExceeded = false,
+  serverBackupAvailable = false,
   onSyncNow
 }) => {
   if (isOnline && pendingCount === 0 && !isSyncing) {
@@ -341,7 +345,7 @@ export const OfflineConnectivityBar: React.FC<OfflineConnectivityBarProps> = ({
       role="status"
       aria-live="polite"
       className={`mb-4 no-print rounded-xl border px-3.5 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs ${
-        !isOnline
+        !isOnline || cloudQuotaExceeded
           ? 'bg-amber-50 border-amber-300 text-amber-950'
           : 'bg-blue-50 border-blue-300 text-blue-950'
       }`}
@@ -352,15 +356,17 @@ export const OfflineConnectivityBar: React.FC<OfflineConnectivityBarProps> = ({
         ) : isSyncing ? (
           <RefreshCw className="w-4 h-4 text-blue-700 animate-spin shrink-0" />
         ) : (
-          <CloudUpload className="w-4 h-4 text-blue-700 shrink-0" />
+          <CloudUpload className={`w-4 h-4 shrink-0 ${cloudQuotaExceeded ? 'text-amber-700' : 'text-blue-700'}`} />
         )}
         <div className="min-w-0">
           <span className="font-bold">
             {!isOnline
               ? 'Mode Offline Aktif'
               : isSyncing
-              ? 'Menyinkronkan Perubahan Lokal ke Cloud...'
-              : 'Menunggu Sinkronisasi ke Cloud'}
+              ? 'Menyinkronkan Delta ke Cloud...'
+              : cloudQuotaExceeded
+              ? 'Antrean Delta Menunggu Reset Kuota Cloud'
+              : 'Menunggu Sinkronisasi Delta ke Cloud'}
           </span>
           <span className="mx-1.5 text-slate-400" aria-hidden="true">·</span>
           <span className="opacity-90">
@@ -368,12 +374,16 @@ export const OfflineConnectivityBar: React.FC<OfflineConnectivityBarProps> = ({
               ? pendingCount > 0
                 ? `${pendingCount} perubahan tersimpan aman di perangkat dan akan otomatis dikirim saat online.`
                 : 'Anda tetap dapat melihat data tersimpan dan menginput nilai secara lokal.'
+              : cloudQuotaExceeded
+              ? serverBackupAvailable
+                ? `${pendingCount} perubahan tertunda sudah diamankan di Cadangan Server & perangkat ini.`
+                : `${pendingCount} perubahan tertunda tersimpan aman di perangkat ini hingga kuota Cloud direset.`
               : `${pendingCount} perubahan lokal siap disinkronkan ke server Cloud.`}
           </span>
         </div>
       </div>
 
-      {isOnline && pendingCount > 0 && (
+      {isOnline && pendingCount > 0 && !cloudQuotaExceeded && (
         <button
           type="button"
           onClick={onSyncNow}
